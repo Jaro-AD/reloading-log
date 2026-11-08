@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -26,7 +26,7 @@ function blank() {
   return {
     v: 1,
     settings: { lenUnit: 'mm', distance: 100, flAfter: 3, annealEvery: 5, retireAt: null, lowBullets: 50, lowPrimers: 100, lowPowderG: 200 },
-    rifles: [], bullets: [], powders: [], primers: [], brass: [], loads: [], batches: [], sessions: []
+    rifles: [], bullets: [], powders: [], primers: [], brass: [], loads: [], batches: [], sessions: [], products: {}
   };
 }
 function idb() {
@@ -51,6 +51,7 @@ function normalise(d) {
   const out = { ...b, ...d, settings: { ...b.settings, ...(d.settings || {}) } };
   COLS.forEach(c => { if (!Array.isArray(out[c])) out[c] = []; });
   out.sessions.forEach(s => { if (!Array.isArray(s.strings)) s.strings = []; });
+  if (!out.products || typeof out.products !== 'object' || Array.isArray(out.products)) out.products = {};
   return out;
 }
 async function save() {
@@ -78,7 +79,7 @@ const nRifle = r => r ? r.name + (r.calibre ? ` (${r.calibre})` : '') : '?';
 const nBullet = b => b ? `${b.maker || ''} ${b.weight ?? ''}gr ${b.name || ''}`.trim() : '?';
 const nPowder = p => p ? `${p.maker || ''} ${p.name || ''}`.trim() + (p.lot ? ` · lot ${p.lot}` : '') : '?';
 const nPrimer = p => p ? `${p.maker || ''} ${p.name || ''}`.trim() : '?';
-const nBrass = b => b ? b.name : '?';
+const nBrass = b => b ? b.name + (b.mark ? ` [${b.mark}]` : '') : '?';
 const nLoad = l => l ? (l.name || `${fx(l.charge, 1)}gr ${nPowder(get('powders', l.powderId))}`) : '?';
 const nBatch = b => { if (!b) return '?'; const l = get('loads', b.loadId); return `${b.date} · ${nLoad(l)}`; };
 
@@ -214,6 +215,7 @@ function openForm(cfg) {
     if (typeof r === 'string') return err(r);
     closeModal(); await save();
     if (typeof r === 'object' && r && r.go) location.hash = r.go; else render();
+    if (typeof r === 'object' && r && r.next) r.next();
   };
   if (cfg.onDelete) $('#fdel').onclick = async () => {
     if (!confirm('Delete this permanently?')) return;
@@ -221,7 +223,7 @@ function openForm(cfg) {
     closeModal(); await save(); if (cfg.afterDelete) location.hash = cfg.afterDelete; else render();
   };
 }
-function closeModal() { const m = $('#modal'); m.hidden = true; m.innerHTML = ''; }
+function closeModal() { stopScanner(); const m = $('#modal'); m.hidden = true; m.innerHTML = ''; }
 function upsert(col, obj, vals) {
   if (obj) { Object.assign(obj, vals); return obj; }
   const n = { id: uid(), created: Date.now(), ...vals }; S[col].push(n); return n;
@@ -230,6 +232,17 @@ function remove(col, id) { S[col] = S[col].filter(x => x.id !== id); }
 function inUse(msg, n) { return n ? `Can't delete — ${msg} (${n}). Remove those first.` : null; }
 
 /* ---------- forms ---------- */
+const scanFields = unitHelp => [
+  { type: 'section', label: 'Packet barcode (fills in next time you scan)' },
+  { k: 'barcode', label: 'Barcode', ph: 'Scan or type' },
+  { k: 'packQty', label: 'Pack size', type: 'num', help: unitHelp }
+];
+function learn(kind, o) {
+  if (!o.barcode) return;
+  const K = KINDS[kind];
+  const values = {}; K.tpl.forEach(k => { if (o[k] != null && o[k] !== '') values[k] = o[k]; });
+  S.products[o.barcode] = { kind, packQty: o.packQty ?? S.products[o.barcode]?.packQty ?? null, values };
+}
 function rifleForm(r) {
   openForm({
     title: r ? 'Edit rifle' : 'New rifle', values: r,
@@ -247,9 +260,9 @@ function rifleForm(r) {
     afterDelete: '#/rifles'
   });
 }
-function bulletForm(b) {
+function bulletForm(b, preset) {
   openForm({
-    title: b ? 'Edit bullet' : 'New bullet', values: b,
+    title: b ? 'Edit bullet' : 'New bullet', values: b || preset,
     fields: [
       { k: 'maker', label: 'Maker', req: true, ph: 'Sierra' },
       { k: 'name', label: 'Model', req: true, ph: 'MatchKing HPBT' },
@@ -257,48 +270,52 @@ function bulletForm(b) {
       { k: 'diameter', label: 'Diameter / calibre', ph: '.308' },
       { k: 'bc', label: 'BC (G1/G7)', ph: 'G7 0.243' },
       { k: 'lot', label: 'Lot number' },
-      { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true, help: 'Add to this number each time you buy more. Stock left is worked out from batches loaded.' },
+      { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true, help: 'Add to this number each time you buy more (or use Scan packet). Stock left is worked out from batches loaded.' },
+      ...scanFields('Bullets per box, e.g. 100'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { upsert('bullets', b, o); },
+    onSave: o => { upsert('bullets', b, o); learn('bullet', o); },
     onDelete: b && (() => inUse('loads use this bullet', S.loads.filter(l => l.bulletId === b.id).length) || remove('bullets', b.id))
   });
 }
-function powderForm(p) {
+function powderForm(p, preset) {
   openForm({
-    title: p ? 'Edit powder' : 'New powder', values: p,
+    title: p ? 'Edit powder' : 'New powder', values: p || preset,
     fields: [
       { k: 'maker', label: 'Maker', req: true, ph: 'Somchem / Hodgdon' },
       { k: 'name', label: 'Powder', req: true, ph: 'S365 / Varget' },
       { k: 'lot', label: 'Lot number', full: true, help: 'Add each new powder lot separately — burn rates vary between lots.' },
       { k: 'grams', label: 'Total bought (grams)', type: 'num', full: true, help: 'e.g. 1 kg tub = 1000. Add to it when you buy more of the same lot.' },
+      ...scanFields('Grams per container, e.g. 1000'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { upsert('powders', p, o); },
+    onSave: o => { upsert('powders', p, o); learn('powder', o); },
     onDelete: p && (() => inUse('loads use this powder', S.loads.filter(l => l.powderId === p.id).length) || remove('powders', p.id))
   });
 }
-function primerForm(p) {
+function primerForm(p, preset) {
   openForm({
-    title: p ? 'Edit primer' : 'New primer', values: p,
+    title: p ? 'Edit primer' : 'New primer', values: p || preset,
     fields: [
       { k: 'maker', label: 'Maker', req: true, ph: 'CCI / PMP / Federal' },
       { k: 'name', label: 'Model', req: true, ph: 'BR2 / 210M' },
       { k: 'size', label: 'Type', type: 'select', options: PRIMER_SIZES },
       { k: 'lot', label: 'Lot number' },
       { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true },
+      ...scanFields('Primers per box, e.g. 1000'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { upsert('primers', p, o); },
+    onSave: o => { upsert('primers', p, o); learn('primer', o); },
     onDelete: p && (() => inUse('loads use this primer', S.loads.filter(l => l.primerId === p.id).length) || remove('primers', p.id))
   });
 }
-function brassForm(br) {
+function brassForm(br, preset) {
   const d = S.settings;
   openForm({
-    title: br ? 'Edit brass lot' : 'New brass lot', values: br,
+    title: br ? 'Edit brass lot' : 'New brass lot', values: br || preset,
     fields: [
       { k: 'name', label: 'Lot name', req: true, full: true, ph: 'e.g. Lapua 308 – Lot A' },
+      { k: 'mark', label: 'Case marking / box label', full: true, ph: 'e.g. 1 red dot on head · box "308-A"', help: 'How you tell this lot apart physically — mark the case heads and label the box' },
       { k: 'headstamp', label: 'Headstamp / maker', ph: 'Lapua' },
       { k: 'calibre', label: 'Calibre', ph: '.308 Win' },
       { k: 'count', label: 'Number of cases', type: 'num' },
@@ -315,9 +332,10 @@ function brassForm(br) {
       { k: 'trimTo', label: 'Trim-to length', type: 'len' },
       { k: 'lastLen', label: 'Current measured length', type: 'len' },
       { k: 'retired', label: 'Lot retired', type: 'check' },
+      ...scanFields('Cases per box, e.g. 100'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { const n = upsert('brass', br, o); return br ? null : { go: '#/brasslot/' + n.id }; },
+    onSave: o => { const n = upsert('brass', br, o); learn('brass', o); return br ? null : { go: '#/brasslot/' + n.id }; },
     onDelete: br && (() => inUse('batches used this brass', S.batches.filter(b => b.brassId === br.id).length) || remove('brass', br.id)),
     afterDelete: '#/brass'
   });
@@ -545,6 +563,77 @@ function ladderValues(o) {
   const step = o.vary === 'cbto' ? fromDisp(o.step) : o.step;
   return Array.from({ length: Math.round(o.steps) }, (_, i) => +(base + step * i).toFixed(4));
 }
+/* ---------- barcode scanning ---------- */
+const KINDS = {
+  bullet: { col: 'bullets', qty: 'qtyBought', unit: 'bullets', tpl: ['maker', 'name', 'weight', 'diameter', 'bc'], form: (i, p) => bulletForm(i, p), namer: b => nBullet(b), label: 'Bullets' },
+  powder: { col: 'powders', qty: 'grams', unit: 'g', tpl: ['maker', 'name'], form: (i, p) => powderForm(i, p), namer: p => nPowder(p), label: 'Powder' },
+  primer: { col: 'primers', qty: 'qtyBought', unit: 'primers', tpl: ['maker', 'name', 'size'], form: (i, p) => primerForm(i, p), namer: p => nPrimer(p), label: 'Primers' },
+  brass: { col: 'brass', qty: 'count', unit: 'cases', tpl: ['headstamp', 'calibre'], form: (i, p) => brassForm(i, p), namer: b => nBrass(b), label: 'Brass' }
+};
+let _scanner = null;
+function loadScanLib() {
+  if (window.Html5Qrcode) return Promise.resolve();
+  return new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'vendor/html5-qrcode.min.js'; s.onload = res; s.onerror = () => rej(new Error('Scanner could not load')); document.head.appendChild(s); });
+}
+async function stopScanner() { if (_scanner) { const s = _scanner; _scanner = null; try { await s.stop(); } catch (_) {} try { s.clear(); } catch (_) {} } }
+function openScanner(onCode, kindHint) {
+  const m = $('#modal');
+  m.innerHTML = `<div class="sheet"><div class="sheet-h"><h3>Scan packet barcode</h3><button type="button" data-close aria-label="Close">✕</button></div>
+    <div id="reader" class="reader"></div><div id="scanmsg" class="sub" style="margin:8px 0">Starting camera… hold the barcode flat, 10–20 cm away.</div>
+    <form id="manualcode" class="row" style="margin:10px 0 6px"><input class="grow" name="code" inputmode="numeric" placeholder="Or type the barcode number" style="flex:1"><button class="btn" type="submit">Use</button></form></div>`;
+  m.hidden = false;
+  let done = false;
+  const finish = async code => { if (done) return; done = true; await stopScanner(); closeModal(); onCode(String(code).trim(), kindHint); };
+  $('#manualcode').onsubmit = e => { e.preventDefault(); const v = e.target.code.value.trim(); if (v) finish(v); };
+  loadScanLib().then(() => {
+    if (done || !$('#reader')) return;
+    const F = Html5QrcodeSupportedFormats;
+    _scanner = new Html5Qrcode('reader', { formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF, F.QR_CODE, F.DATA_MATRIX], useBarCodeDetectorIfSupported: true, verbose: false });
+    return _scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: (w, h) => ({ width: Math.floor(w * 0.85), height: Math.floor(Math.min(h, w) * 0.5) }) }, code => { if (navigator.vibrate) navigator.vibrate(80); finish(code); }, () => {})
+      .then(() => { const el = $('#scanmsg'); if (el) el.textContent = 'Point the camera at the barcode.'; });
+  }).catch(e => { const el = $('#scanmsg'); if (el) el.innerHTML = `<span style="color:var(--warn)">Camera not available (${esc(e.message || e)}). Allow camera access, or type the number below.</span>`; });
+}
+function handleCode(code, kindHint) {
+  const prod = S.products[code];
+  if (prod && KINDS[prod.kind]) return stockInForm(code, prod);
+  if (kindHint) return KINDS[kindHint].form(null, { barcode: code });
+  openForm({
+    title: 'New barcode', saveLabel: 'Next',
+    intro: `<div class="alert">Barcode <b>${esc(code)}</b> isn't known yet. Enter the product once — next time this barcode fills everything in.</div>`,
+    fields: [{ k: 'kind', label: 'What is it?', type: 'select', req: true, full: true, options: Object.entries(KINDS).map(([k, K]) => [k, K.label]) }],
+    onSave: o => ({ next: () => KINDS[o.kind].form(null, { barcode: code }) })
+  });
+}
+function stockInForm(code, prod) {
+  const K = KINDS[prod.kind];
+  const items = S[K.col].filter(x => x.barcode === code);
+  openForm({
+    title: 'Stock in — ' + K.label, saveLabel: 'Add stock',
+    intro: `<div class="card"><div class="ttl">${esc(K.namer({ ...prod.values, name: prod.values.name || prod.values.headstamp || '' }))}</div><div class="sub">Barcode ${esc(code)}</div></div>`,
+    values: { itemId: items.length ? items[items.length - 1].id : 'new', packs: 1, packQty: prod.packQty },
+    fields: [
+      { k: 'itemId', label: 'Add to', type: 'select', noBlank: true, full: true, options: [...items.map(i => [i.id, K.namer(i) + (prod.kind !== 'powder' && i.lot ? ' · lot ' + i.lot : '')]), ['new', '+ New lot / new entry']] },
+      { k: 'lot', label: 'Lot number on packet', full: true, help: 'For powder, a different lot always becomes a new entry' },
+      { k: 'packs', label: 'Number of packs', type: 'num', req: true },
+      { k: 'packQty', label: `Per pack (${K.unit})`, type: 'num', req: true },
+      ...(prod.kind === 'brass' ? [{ k: 'name', label: 'Lot name (for new lot)', full: true, ph: `${prod.values.headstamp || ''} ${prod.values.calibre || ''} – Lot B`.trim() }] : [])
+    ],
+    hint: o => o.packs && o.packQty ? `<div class="alert ok">Adds <b>${fx(o.packs * o.packQty, 0)} ${K.unit}</b>${o.itemId === 'new' ? ' as a new entry' : ''}.</div>` : '',
+    onSave: o => {
+      const add = o.packs * o.packQty;
+      if (!(add > 0)) return 'Enter packs and pack size.';
+      prod.packQty = o.packQty;
+      let item = o.itemId !== 'new' ? get(K.col, o.itemId) : null;
+      if (item && prod.kind === 'powder' && o.lot && item.lot && o.lot !== item.lot) return `This tub is lot ${o.lot} but the entry is lot ${item.lot}. Choose "+ New lot".`;
+      if (item) { item[K.qty] = (+item[K.qty] || 0) + add; if (o.lot && !item.lot) item.lot = o.lot; }
+      else {
+        item = upsert(K.col, null, { ...prod.values, barcode: code, packQty: o.packQty, lot: o.lot, [K.qty]: add });
+        if (prod.kind === 'brass') item.name = o.name || `${prod.values.headstamp || 'Brass'} ${prod.values.calibre || ''} – ${o.lot || today()}`.replace(/\s+/g, ' ');
+      }
+      return { go: prod.kind === 'brass' ? '#/brasslot/' + item.id : '#/' + K.col };
+    }
+  });
+}
 function settingsForm() {
   openForm({
     title: 'Settings', values: S.settings,
@@ -682,13 +771,15 @@ const views = {
   },
   brass() {
     const act = S.brass.filter(b => !b.retired), ret = S.brass.filter(b => b.retired);
-    return `<div class="btns"><button class="btn pri" data-act="newBrass">+ New brass lot</button></div>
-      ${act.map(brassCard).join('') || empty('No brass lots yet.')}${ret.length ? `<h2>Retired</h2>${ret.map(brassCard).join('')}` : ''}`;
+    const cals = [...new Set(act.map(b => (b.calibre || 'Other').trim()))].sort();
+    return `<div class="btns"><button class="btn pri" data-act="newBrass">+ New brass lot</button><button class="btn" data-act="scan" data-kind="brass">▦ Scan</button></div>
+      ${cals.map(c => { const lots = act.filter(b => (b.calibre || 'Other').trim() === c).sort((a, b) => a.name.localeCompare(b.name)); return `<h2>${esc(c)} — ${lots.length} lot(s), ${lots.reduce((a, b) => a + (+b.count || 0), 0)} cases</h2>${lots.map(brassCard).join('')}`; }).join('') || empty('No brass lots yet.')}
+      ${ret.length ? `<h2>Retired</h2>${ret.map(brassCard).join('')}` : ''}`;
   },
   brasslot(q, id) {
     const br = get('brass', id); if (!br) return empty('Brass lot not found.');
     const st = brassState(br);
-    return `<div class="card"><div class="ttl">${esc(br.name)}</div><div class="sub">${esc([br.headstamp, br.calibre, br.count ? br.count + ' cases' : ''].filter(Boolean).join(' · '))}</div>
+    return `<div class="card"><div class="ttl">${esc(br.name)}</div>${br.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(br.mark)}</div>` : ''}<div class="sub">${esc([br.headstamp, br.calibre, br.count ? br.count + ' cases' : ''].filter(Boolean).join(' · '))}</div>
       <div class="kv"><div>Times fired<b>${st.firings}</b></div><div>Neck sizes since FL<b>${st.neck}${st.flAfter != null ? ' / ' + st.flAfter : ''}</b></div><div>Firings since anneal<b>${st.anneal}${st.annealEvery ? ' / ' + st.annealEvery : ''}</b></div>
       <div>Retire at<b>${st.retireAt || '–'}</b></div><div>Last length<b>${fLen(st.lastLen)}</b></div><div>Max / trim-to<b>${fLen(br.maxLen)} / ${fLen(br.trimTo)}</b></div><div>Last trimmed<b>${esc(st.lastTrim || '–')}</b></div><div>Currently loaded<b>${st.loaded}</b></div></div>
       ${br.notes ? `<div class="note">${esc(br.notes)}</div>` : ''}</div>
@@ -698,7 +789,8 @@ const views = {
   },
   setup() {
     const it = (href, t, n) => card(href, `<div class="row"><div class="grow ttl">${t}</div><span class="sub">${n} ›</span></div>`);
-    return `<h2>Equipment &amp; components</h2>
+    return `<div class="btns"><button class="btn pri" data-act="scan">▦ Scan packet barcode</button></div>
+      <h2>Equipment &amp; components</h2>
       ${it('#/rifles', 'Rifles', S.rifles.length)}${it('#/bullets', 'Bullets', S.bullets.length)}${it('#/powders', 'Powders', S.powders.length)}${it('#/primers', 'Primers', S.primers.length)}${it('#/brass', 'Brass lots', S.brass.length)}
       <h2>App</h2>
       <div class="btns"><button class="btn" data-act="settings">Settings &amp; brass rules</button></div>
@@ -712,13 +804,13 @@ const views = {
     return `<div class="btns"><button class="btn pri" data-act="newRifle">+ New rifle</button></div>${S.rifles.map(r => `<div class="card" data-act="editRifle" data-id="${r.id}" style="cursor:pointer"><div class="ttl">${esc(r.name)}</div><div class="sub">${esc([r.calibre, r.twist && 'twist ' + r.twist, r.barrel, r.optic].filter(Boolean).join(' · '))}</div><div class="kv"><div>Round count<b>${rifleRounds(r)}</b></div><div>Loads<b>${S.loads.filter(l => l.rifleId === r.id).length}</b></div></div></div>`).join('') || empty('No rifles yet.')}`;
   },
   bullets() {
-    return `<div class="btns"><button class="btn pri" data-act="newBullet">+ New bullet</button></div>${S.bullets.map(b => stockCard('editBullet', b.id, nBullet(b), [b.diameter, b.bc, b.lot && 'lot ' + b.lot], bulletLeft(b), +b.qtyBought || 0, '')).join('') || empty('No bullets yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newBullet">+ New bullet</button><button class="btn" data-act="scan" data-kind="bullet">▦ Scan</button></div>${S.bullets.map(b => stockCard('editBullet', b.id, nBullet(b), [b.diameter, b.bc, b.lot && 'lot ' + b.lot], bulletLeft(b), +b.qtyBought || 0, '')).join('') || empty('No bullets yet.')}`;
   },
   powders() {
-    return `<div class="btns"><button class="btn pri" data-act="newPowder">+ New powder</button></div>${S.powders.map(p => stockCard('editPowder', p.id, nPowder(p), [], powderLeft(p), +p.grams || 0, ' g')).join('') || empty('No powders yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newPowder">+ New powder</button><button class="btn" data-act="scan" data-kind="powder">▦ Scan</button></div>${S.powders.map(p => stockCard('editPowder', p.id, nPowder(p), [], powderLeft(p), +p.grams || 0, ' g')).join('') || empty('No powders yet.')}`;
   },
   primers() {
-    return `<div class="btns"><button class="btn pri" data-act="newPrimer">+ New primer</button></div>${S.primers.map(p => stockCard('editPrimer', p.id, nPrimer(p), [p.size, p.lot && 'lot ' + p.lot], primerLeft(p), +p.qtyBought || 0, '')).join('') || empty('No primers yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newPrimer">+ New primer</button><button class="btn" data-act="scan" data-kind="primer">▦ Scan</button></div>${S.primers.map(p => stockCard('editPrimer', p.id, nPrimer(p), [p.size, p.lot && 'lot ' + p.lot], primerLeft(p), +p.qtyBought || 0, '')).join('') || empty('No primers yet.')}`;
   }
 };
 function stockCard(act, id, title, sub, left, total, unit) {
@@ -735,7 +827,7 @@ function sessionCard(s) {
 }
 function brassCard(b) {
   const st = brassState(b);
-  return card('#/brasslot/' + b.id, `<div class="ttl">${esc(b.name)}</div><div class="sub">Fired ${st.firings}× · ${st.neck} neck since FL · ${st.anneal} since anneal${st.loaded ? ` · ${st.loaded} loaded` : ''}</div><div style="margin-top:6px">${st.alerts.map(([c, t]) => pill(c, t.split(' (')[0].split(':')[0])).join(' ') || pill('ok', 'Nothing due')}</div>`);
+  return card('#/brasslot/' + b.id, `<div class="ttl">${esc(b.name)}${b.count ? ` <span class="sub">· ${b.count} cases</span>` : ''}</div>${b.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(b.mark)}</div>` : ''}<div class="sub">Fired ${st.firings}× · ${st.neck} neck since FL · ${st.anneal} since anneal${st.loaded ? ` · ${st.loaded} loaded` : ''}</div><div style="margin-top:6px">${st.alerts.map(([c, t]) => pill(c, t.split(' (')[0].split(':')[0])).join(' ') || pill('ok', 'Nothing due')}</div>`);
 }
 function chart(pts, xt, yt, xl, withErr) {
   const W = 340, H = 200, L = 46, R = 10, T = 12, B = 34;
@@ -813,6 +905,7 @@ const ACTIONS = {
   newPowder: () => powderForm(), editPowder: d => powderForm(get('powders', d.id)),
   newPrimer: () => primerForm(), editPrimer: d => primerForm(get('primers', d.id)),
   settings: () => settingsForm(),
+  scan: d => openScanner(handleCode, d.kind),
   export: () => download(`reload-log-backup-${today()}.json`, JSON.stringify({ ...S, exported: new Date().toISOString(), app: APP_VERSION }, null, 1), 'application/json'),
   import: () => $('#importfile').click(),
   csv: () => csvExport()

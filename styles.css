@@ -74,3 +74,5 @@ select:focus,input:focus,textarea:focus{outline:2px solid var(--acc);outline-off
 .bar i{display:block;height:100%;background:var(--acc)}
 .muted{color:var(--mut)}
 .disclaimer{font-size:12px;color:var(--mut);margin-top:16px;line-height:1.5}
+.reader{width:100%;min-height:220px;background:#000;border-radius:var(--r);overflow:hidden}
+.reader video{width:100%!important;height:auto!important;display:block}
