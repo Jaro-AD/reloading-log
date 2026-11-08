@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14171a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Reload Log">
+<title>Reload Log</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <button class="back" id="back" aria-label="Back" hidden>‹</button>
+  <h1 id="title">Reload Log</h1>
+  <span id="savestate" class="savestate"></span>
+</header>
+<main id="view"></main>
+<nav class="tabs" id="tabs">
+  <a href="#/home" data-tab="home"><span>⌂</span>Home</a>
+  <a href="#/loads" data-tab="loads"><span>◎</span>Loads</a>
+  <a href="#/batches" data-tab="batches"><span>▤</span>Batches</a>
+  <a href="#/range" data-tab="range"><span>⌖</span>Range</a>
+  <a href="#/brass" data-tab="brass"><span>▮</span>Brass</a>
+  <a href="#/setup" data-tab="setup"><span>⚙</span>Setup</a>
+</nav>
+<div id="modal" class="modal" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
