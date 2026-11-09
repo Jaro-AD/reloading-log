@@ -1,6 +1,6 @@
 # Reload Log
 
-A phone-friendly app for recording reloading and range data: rifles, components and stock, brass lots (firings, neck sizes since FL, anneal cycles, trim), load recipes, ladder and seating tests, batches, and range sessions (velocity avg/ES/SD, group size in MOA and mil).
+A phone-friendly app for recording reloading and range data: rifles, components and stock, brass lots (firings, neck sizes since FL, anneal cycles, trim), load recipes with cost per round, ladder and seating tests, batches, and range sessions (velocity avg/ES/SD, group size in MOA and mil).
 
 - Plain HTML/JS app, installable on a phone (Share → Add to Home Screen), works offline.
 - All data is stored **on the device only** (IndexedDB). Use **Setup → Export backup** regularly.

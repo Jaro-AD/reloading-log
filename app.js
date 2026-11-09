@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -25,7 +25,7 @@ let S, _db;
 function blank() {
   return {
     v: 1,
-    settings: { lenUnit: 'mm', distance: 100, flAfter: 3, annealEvery: 5, retireAt: null, lowBullets: 50, lowPrimers: 100, lowPowderG: 200 },
+    settings: { lenUnit: 'mm', distance: 100, flAfter: 3, annealEvery: 5, retireAt: null, lowBullets: 50, lowPrimers: 100, lowPowderG: 200, currency: 'R', brassLife: 5 },
     rifles: [], bullets: [], powders: [], primers: [], brass: [], loads: [], batches: [], sessions: [], products: {}
   };
 }
@@ -114,6 +114,39 @@ function stockUsed(kind, id) {
 const bulletLeft = b => (+b.qtyBought || 0) - stockUsed('bullet', b.id);
 const primerLeft = p => (+p.qtyBought || 0) - stockUsed('primer', p.id);
 const powderLeft = p => (+p.grams || 0) - stockUsed('powder', p.id);
+
+/* ---------- cost ---------- */
+const cur = () => S.settings.currency || 'R';
+const money = (v, d = 2) => v == null || isNaN(v) ? '–' : cur() + ' ' + (+v).toFixed(d);
+// Price per single unit: per bullet / primer / case, or per gram of powder.
+const unitPrice = x => x && +x.price > 0 && +x.priceQty > 0 ? +x.price / +x.priceQty : null;
+// Brass is reused, so its cost is spread over the lot's life (retire-at firings, else the Settings default).
+const brassLife = br => rule(br, 'retireAt') || +S.settings.brassLife || 1;
+function roundCost(l, brassId) {
+  if (!l) return null;
+  const br = get('brass', brassId || l.brassId);
+  const pw = unitPrice(get('powders', l.powderId)), bc = unitPrice(br);
+  const parts = {
+    bullet: unitPrice(get('bullets', l.bulletId)),
+    powder: pw != null ? pw * (+l.charge || 0) * GR_TO_G : null,
+    primer: unitPrice(get('primers', l.primerId)),
+    brass: bc != null ? bc / brassLife(br) : null
+  };
+  const have = Object.values(parts).filter(v => v != null);
+  return { ...parts, total: have.length ? have.reduce((a, b) => a + b, 0) : null, missing: Object.keys(parts).filter(k => parts[k] == null) };
+}
+// Batches keep the cost from the day they were loaded, so later price changes don't rewrite history.
+const batchCost = b => b.cost || roundCost(get('loads', b.loadId), b.brassId);
+const costNote = c => c && c.missing.length ? ` <span class="sub">(no price: ${c.missing.join(', ')})</span>` : '';
+function costBreakdown(c, extra = '') {
+  if (!c || c.total == null) return '<div class="alert">No component prices yet — add them under Setup (bullets, powder, primers, brass) to see cost per round.</div>';
+  return `<div class="card kv" style="margin-top:0"><div>Per round<b>${money(c.total)}</b></div>${extra}<div>Bullet<b>${money(c.bullet)}</b></div><div>Powder<b>${money(c.powder)}</b></div><div>Primer<b>${money(c.primer)}</b></div><div>Brass (per firing)<b>${money(c.brass)}</b></div></div>${c.missing.length ? `<div class="sub">Excludes ${c.missing.join(', ')} — no price recorded.</div>` : ''}`;
+}
+const priceFields = (forWhat, def) => [
+  { type: 'section', label: 'Price (for cost per round)' },
+  { k: 'price', label: `Price paid (${cur()})`, type: 'num', ph: 'e.g. 850' },
+  { k: 'priceQty', label: `For how many ${forWhat}`, type: 'num', def, help: `e.g. price of ${def} ${forWhat}` }
+];
 
 function rule(br, k) { return br[k] != null && br[k] !== '' ? +br[k] : (S.settings[k] != null && S.settings[k] !== '' ? +S.settings[k] : null); }
 
@@ -271,6 +304,7 @@ function bulletForm(b, preset) {
       { k: 'bc', label: 'BC (G1/G7)', ph: 'G7 0.243' },
       { k: 'lot', label: 'Lot number' },
       { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true, help: 'Add to this number each time you buy more (or use Scan packet). Stock left is worked out from batches loaded.' },
+      ...priceFields('bullets', 100),
       ...scanFields('Bullets per box, e.g. 100'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
@@ -286,6 +320,7 @@ function powderForm(p, preset) {
       { k: 'name', label: 'Powder', req: true, ph: 'S365 / Varget' },
       { k: 'lot', label: 'Lot number', full: true, help: 'Add each new powder lot separately — burn rates vary between lots.' },
       { k: 'grams', label: 'Total bought (grams)', type: 'num', full: true, help: 'e.g. 1 kg tub = 1000. Add to it when you buy more of the same lot.' },
+      ...priceFields('grams', 1000),
       ...scanFields('Grams per container, e.g. 1000'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
@@ -302,6 +337,7 @@ function primerForm(p, preset) {
       { k: 'size', label: 'Type', type: 'select', options: PRIMER_SIZES },
       { k: 'lot', label: 'Lot number' },
       { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true },
+      ...priceFields('primers', 100),
       ...scanFields('Primers per box, e.g. 1000'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
@@ -332,6 +368,7 @@ function brassForm(br, preset) {
       { k: 'trimTo', label: 'Trim-to length', type: 'len' },
       { k: 'lastLen', label: 'Current measured length', type: 'len' },
       { k: 'retired', label: 'Lot retired', type: 'check' },
+      ...priceFields('cases', 100),
       ...scanFields('Cases per box, e.g. 100'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
@@ -380,7 +417,7 @@ function loadForm(l, copyFrom) {
       { k: 'series', label: 'Test series tag', ph: 'groups ladder tests' },
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    hint: chargeHint,
+    hint: o => { const c = roundCost(o, o.brassId); return chargeHint(o) + (c && c.total != null ? `<div class="sub">Cost ≈ <b>${money(c.total)}</b> per round${costNote(c)}</div>` : ''); },
     onSave: o => {
       if (o.maxCharge != null && o.charge > o.maxCharge) return 'Charge is over the manual maximum.';
       if (o.charge <= 0) return 'Charge must be more than 0.';
@@ -427,6 +464,8 @@ function batchForm(b, preset) {
         if (pr && primerLeft(pr) + (b && get('loads', b.loadId)?.primerId === pr.id ? +b.qty || 0 : 0) < q) need.push('primers');
         if (pw && powderLeft(pw) + own * (+l.charge || 0) * GR_TO_G < q * (+l.charge || 0) * GR_TO_G) need.push('powder');
         h += `<div class="card" style="margin-bottom:8px"><div class="sub">${esc(nBullet(bu))} · ${esc(nPowder(pw))} <b>${fx(l.charge, 2)}gr</b> · ${esc(nPrimer(pr))}${l.cbto != null ? ` · CBTO ${fLen(l.cbto)}` : ''}${l.coal != null ? ` · COAL ${fLen(l.coal)}` : ''}</div>${q ? `<div class="sub">Uses ${fx(q * (l.charge || 0) * GR_TO_G, 1)} g powder</div>` : ''}</div>`;
+        const c = roundCost(l, o.brassId);
+        if (c && c.total != null) h += `<div class="sub" style="margin-bottom:6px">Cost ≈ <b>${money(c.total)}</b> per round${q ? ` · <b>${money(c.total * q)}</b> for ${q}` : ''}${costNote(c)}</div>`;
         if (need.length) h += `<div class="alert">Stock recorded is too low for: ${need.join(', ')}. Update stock under Setup if you've bought more.</div>`;
       }
       h += brassHint(o.brassId);
@@ -442,7 +481,10 @@ function batchForm(b, preset) {
     onSave: o => {
       if (o.qty <= 0) return 'Rounds must be more than 0.';
       if (b && o.qty < batchFired(b.id)) return `Already ${batchFired(b.id)} fired from this batch.`;
-      const n = upsert('batches', b, o); return b ? null : { go: '#/batch/' + n.id };
+      const reprice = !b || !b.cost || b.cost.missing.length || b.loadId !== o.loadId || b.brassId !== o.brassId;
+      const n = upsert('batches', b, o);
+      if (reprice) { const c = roundCost(get('loads', n.loadId), n.brassId); if (c && c.total != null) n.cost = c; }
+      return b ? null : { go: '#/batch/' + n.id };
     },
     onDelete: b && (() => inUse('range strings were shot from this batch', allStrings().filter(s => s.batchId === b.id).length) || remove('batches', b.id)),
     afterDelete: '#/batches'
@@ -616,6 +658,7 @@ function stockInForm(code, prod) {
       { k: 'lot', label: 'Lot number on packet', full: true, help: 'For powder, a different lot always becomes a new entry' },
       { k: 'packs', label: 'Number of packs', type: 'num', req: true },
       { k: 'packQty', label: `Per pack (${K.unit})`, type: 'num', req: true },
+      { k: 'packPrice', label: `Price per pack (${cur()})`, type: 'num', full: true, help: 'Optional — updates the price used for cost per round' },
       ...(prod.kind === 'brass' ? [{ k: 'name', label: 'Lot name (for new lot)', full: true, ph: `${prod.values.headstamp || ''} ${prod.values.calibre || ''} – Lot B`.trim() }] : [])
     ],
     hint: o => o.packs && o.packQty ? `<div class="alert ok">Adds <b>${fx(o.packs * o.packQty, 0)} ${K.unit}</b>${o.itemId === 'new' ? ' as a new entry' : ''}.</div>` : '',
@@ -630,6 +673,7 @@ function stockInForm(code, prod) {
         item = upsert(K.col, null, { ...prod.values, barcode: code, packQty: o.packQty, lot: o.lot, [K.qty]: add });
         if (prod.kind === 'brass') item.name = o.name || `${prod.values.headstamp || 'Brass'} ${prod.values.calibre || ''} – ${o.lot || today()}`.replace(/\s+/g, ' ');
       }
+      if (o.packPrice > 0) { item.price = o.packPrice; item.priceQty = o.packQty; }
       return { go: prod.kind === 'brass' ? '#/brasslot/' + item.id : '#/' + K.col };
     }
   });
@@ -644,6 +688,9 @@ function settingsForm() {
       { k: 'flAfter', label: 'FL resize after N neck sizes', type: 'num' },
       { k: 'annealEvery', label: 'Anneal every N firings', type: 'num' },
       { k: 'retireAt', label: 'Retire after N firings', type: 'num' },
+      { type: 'section', label: 'Cost' },
+      { k: 'currency', label: 'Currency symbol', ph: 'R' },
+      { k: 'brassLife', label: 'Spread brass cost over N firings', type: 'num', help: "Used when a lot has no 'retire after' rule" },
       { type: 'section', label: 'Low stock warnings' },
       { k: 'lowBullets', label: 'Bullets below', type: 'num' },
       { k: 'lowPrimers', label: 'Primers below', type: 'num' },
@@ -663,7 +710,7 @@ function loadCard(l) {
   const s = loadSummary(l.id);
   return card('#/load/' + l.id, `<div class="row"><div class="grow ttl">${esc(nLoad(l))}</div>${statusPill(l.status)}</div>
     <div class="sub">${esc(nRifle(get('rifles', l.rifleId)))} · ${esc(nBullet(get('bullets', l.bulletId)))}</div>
-    <div class="kv"><div>Charge<b>${fx(l.charge, 2)} gr</b></div><div>CBTO<b>${fLen(l.cbto)}</b></div><div>Avg vel / SD<b>${s.n ? fx(s.avg, 0) + ' / ' + fx(s.sd, 1) : '–'}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div></div>`);
+    <div class="kv"><div>Charge<b>${fx(l.charge, 2)} gr</b></div><div>CBTO<b>${fLen(l.cbto)}</b></div><div>Avg vel / SD<b>${s.n ? fx(s.avg, 0) + ' / ' + fx(s.sd, 1) : '–'}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Cost / round<b>${money(roundCost(l)?.total)}</b></div></div>`);
 }
 
 const views = {
@@ -710,6 +757,7 @@ const views = {
       ${l.maxCharge == null ? '<div class="alert">No manual max recorded for this load.</div>' : ''}
       <div class="btns"><button class="btn pri" data-act="newBatch" data-load="${l.id}">+ Load a batch</button><button class="btn" data-act="editLoad" data-id="${l.id}">Edit</button><button class="btn" data-act="copyLoad" data-id="${l.id}">Copy &amp; tweak</button></div>
       ${l.series ? `<a class="card" href="#/series/${encodeURIComponent(l.series)}"><span class="sub">Part of test series</span> <b>${esc(l.series)}</b> ›</a>` : ''}
+      <h2>Cost per round (current prices)</h2>${costBreakdown(roundCost(l))}
       <h2>Performance</h2>
       <div class="card kv" style="margin-top:0"><div>Shots<b>${s.shots}</b></div><div>Avg vel<b>${fx(s.avg, 0)}</b></div><div>ES (all)<b>${fx(s.es, 0)}</b></div><div>SD (all)<b>${fx(s.sd, 1)}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Avg group<b>${s.avgMoa ? fx(s.avgMoa, 2) + ' MOA' : '–'}</b></div></div>
       ${strs.length ? `<div class="tblwrap"><table><tr><th>Date</th><th>Dist</th><th>Shots</th><th>Avg</th><th>ES</th><th>SD</th><th>Group</th><th>MOA</th></tr>${strs.map(st => { const v = stats(parseVels(st.vels)); return `<tr data-go="#/session/${st.session.id}"><td>${esc(st.session.date)}</td><td>${esc(st.session.distance)}m</td><td>${st.shots}</td><td>${fx(v.avg, 0)}</td><td>${fx(v.es, 0)}</td><td>${fx(v.sd, 1)}</td><td>${st.groupMm ? fx(st.groupMm, 0) + 'mm' : '–'}</td><td>${fx(moa(st.groupMm, st.session.distance), 2)}${st.pressureSigns ? ' ⚠' : ''}</td></tr>`; }).join('')}</table></div>` : empty('Not shot yet.')}
@@ -750,6 +798,7 @@ const views = {
       <div>Annealed<b>${b.annealed ? 'Yes' : 'No'}</b></div><div>Trimmed<b>${b.trimmed ? 'Yes' : 'No'}</b></div><div>Case length<b>${fLen(b.measuredLen)}</b></div><div>Bump<b>${esc(b.bump || '–')}</b></div></div>
       ${b.notes ? `<div class="note">${esc(b.notes)}</div>` : ''}</div>
       <div class="btns"><a class="btn" href="#/load/${b.loadId}" style="text-decoration:none;text-align:center">View load</a><button class="btn" data-act="editBatch" data-id="${b.id}">Edit</button></div>
+      <h2>Cost</h2>${(c => costBreakdown(c, c && c.total != null ? `<div>Whole batch<b>${money(c.total * (+b.qty || 0))}</b></div><div>Fired so far<b>${money(c.total * batchFired(b.id))}</b></div>` : ''))(batchCost(b))}
       <h2>Shot at the range</h2>${strs.map(st => card('#/session/' + st.session.id, `<div class="ttl">${esc(st.session.date)} · ${esc(st.session.distance)}m</div><div class="sub">${st.shots} shots${st.groupMm ? ` · ${fx(moa(st.groupMm, st.session.distance), 2)} MOA` : ''}</div>`)).join('') || empty('Not fired yet.')}`;
   },
   range() {
@@ -804,13 +853,13 @@ const views = {
     return `<div class="btns"><button class="btn pri" data-act="newRifle">+ New rifle</button></div>${S.rifles.map(r => `<div class="card" data-act="editRifle" data-id="${r.id}" style="cursor:pointer"><div class="ttl">${esc(r.name)}</div><div class="sub">${esc([r.calibre, r.twist && 'twist ' + r.twist, r.barrel, r.optic].filter(Boolean).join(' · '))}</div><div class="kv"><div>Round count<b>${rifleRounds(r)}</b></div><div>Loads<b>${S.loads.filter(l => l.rifleId === r.id).length}</b></div></div></div>`).join('') || empty('No rifles yet.')}`;
   },
   bullets() {
-    return `<div class="btns"><button class="btn pri" data-act="newBullet">+ New bullet</button><button class="btn" data-act="scan" data-kind="bullet">▦ Scan</button></div>${S.bullets.map(b => stockCard('editBullet', b.id, nBullet(b), [b.diameter, b.bc, b.lot && 'lot ' + b.lot], bulletLeft(b), +b.qtyBought || 0, '')).join('') || empty('No bullets yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newBullet">+ New bullet</button><button class="btn" data-act="scan" data-kind="bullet">▦ Scan</button></div>${S.bullets.map(b => stockCard('editBullet', b.id, nBullet(b), [b.diameter, b.bc, b.lot && 'lot ' + b.lot, unitPrice(b) != null && money(unitPrice(b)) + ' each'], bulletLeft(b), +b.qtyBought || 0, '')).join('') || empty('No bullets yet.')}`;
   },
   powders() {
-    return `<div class="btns"><button class="btn pri" data-act="newPowder">+ New powder</button><button class="btn" data-act="scan" data-kind="powder">▦ Scan</button></div>${S.powders.map(p => stockCard('editPowder', p.id, nPowder(p), [], powderLeft(p), +p.grams || 0, ' g')).join('') || empty('No powders yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newPowder">+ New powder</button><button class="btn" data-act="scan" data-kind="powder">▦ Scan</button></div>${S.powders.map(p => stockCard('editPowder', p.id, nPowder(p), [unitPrice(p) != null && money(unitPrice(p) * 1000) + ' per kg'], powderLeft(p), +p.grams || 0, ' g')).join('') || empty('No powders yet.')}`;
   },
   primers() {
-    return `<div class="btns"><button class="btn pri" data-act="newPrimer">+ New primer</button><button class="btn" data-act="scan" data-kind="primer">▦ Scan</button></div>${S.primers.map(p => stockCard('editPrimer', p.id, nPrimer(p), [p.size, p.lot && 'lot ' + p.lot], primerLeft(p), +p.qtyBought || 0, '')).join('') || empty('No primers yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newPrimer">+ New primer</button><button class="btn" data-act="scan" data-kind="primer">▦ Scan</button></div>${S.primers.map(p => stockCard('editPrimer', p.id, nPrimer(p), [p.size, p.lot && 'lot ' + p.lot, unitPrice(p) != null && money(unitPrice(p)) + ' each'], primerLeft(p), +p.qtyBought || 0, '')).join('') || empty('No primers yet.')}`;
   }
 };
 function stockCard(act, id, title, sub, left, total, unit) {
@@ -819,7 +868,7 @@ function stockCard(act, id, title, sub, left, total, unit) {
 }
 function batchCard(b) {
   const left = batchLeft(b);
-  return card('#/batch/' + b.id, `<div class="row"><div class="grow"><div class="ttl">${esc(nLoad(get('loads', b.loadId)))}</div><div class="sub">${esc(b.date)} · ${esc(nBrass(get('brass', b.brassId)))}${b.annealed ? ' · annealed' : ''}</div></div><div style="text-align:right"><div class="ttl">${left}/${b.qty}</div><div class="sub">left</div></div></div>`);
+  return card('#/batch/' + b.id, `<div class="row"><div class="grow"><div class="ttl">${esc(nLoad(get('loads', b.loadId)))}</div><div class="sub">${esc(b.date)} · ${esc(nBrass(get('brass', b.brassId)))}${b.annealed ? ' · annealed' : ''}${(c => c && c.total != null ? ' · ' + money(c.total) + '/rd' : '')(batchCost(b))}</div></div><div style="text-align:right"><div class="ttl">${left}/${b.qty}</div><div class="sub">left</div></div></div>`);
 }
 function sessionCard(s) {
   const shots = s.strings.reduce((a, st) => a + (+st.shots || 0), 0);
@@ -827,7 +876,7 @@ function sessionCard(s) {
 }
 function brassCard(b) {
   const st = brassState(b);
-  return card('#/brasslot/' + b.id, `<div class="ttl">${esc(b.name)}${b.count ? ` <span class="sub">· ${b.count} cases</span>` : ''}</div>${b.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(b.mark)}</div>` : ''}<div class="sub">Fired ${st.firings}× · ${st.neck} neck since FL · ${st.anneal} since anneal${st.loaded ? ` · ${st.loaded} loaded` : ''}</div><div style="margin-top:6px">${st.alerts.map(([c, t]) => pill(c, t.split(' (')[0].split(':')[0])).join(' ') || pill('ok', 'Nothing due')}</div>`);
+  return card('#/brasslot/' + b.id, `<div class="ttl">${esc(b.name)}${b.count ? ` <span class="sub">· ${b.count} cases</span>` : ''}</div>${b.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(b.mark)}</div>` : ''}${unitPrice(b) != null ? `<div class="sub">${money(unitPrice(b))}/case · ${money(unitPrice(b) / brassLife(b))} per firing</div>` : ''}<div class="sub">Fired ${st.firings}× · ${st.neck} neck since FL · ${st.anneal} since anneal${st.loaded ? ` · ${st.loaded} loaded` : ''}</div><div style="margin-top:6px">${st.alerts.map(([c, t]) => pill(c, t.split(' (')[0].split(':')[0])).join(' ') || pill('ok', 'Nothing due')}</div>`);
 }
 function chart(pts, xt, yt, xl, withErr) {
   const W = 340, H = 200, L = 46, R = 10, T = 12, B = 34;
