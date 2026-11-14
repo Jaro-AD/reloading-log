@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -214,13 +214,14 @@ function openForm(cfg) {
       case 'len': inp = `<input name="${fd.k}" type="number" step="any" inputmode="decimal" value="${esc(toDisp(val ?? null))}" placeholder="${esc(fd.ph || '')}">`; break;
       case 'num': inp = `<input name="${fd.k}" type="number" step="any" inputmode="decimal" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`; break;
       case 'date': inp = `<input name="${fd.k}" type="date" value="${esc(val || today())}">`; break;
+      case 'password': inp = `<input name="${fd.k}" type="password" autocomplete="off" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`; break;
       default: inp = `<input name="${fd.k}" type="text" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`;
     }
     return `<label class="${cls}"><span>${esc(fd.label)}${fd.type === 'len' ? ` (${unitLbl()})` : ''}${fd.req ? ' *' : ''}</span>${inp}${fd.help ? `<small>${esc(fd.help)}</small>` : ''}</label>`;
   };
   const m = $('#modal');
   m.innerHTML = `<div class="sheet"><div class="sheet-h"><h3>${esc(cfg.title)}</h3><button type="button" data-close aria-label="Close">✕</button></div>
-    <form id="mform" novalidate>${cfg.intro || ''}${cfg.hintTop ? '<div id="fhint" class="hint"></div>' : ''}<div class="fgrid">${cfg.fields.map(f).join('')}</div>
+    <form id="mform" novalidate>${cfg.intro || v._intro || ''}${cfg.hintTop ? '<div id="fhint" class="hint"></div>' : ''}<div class="fgrid">${cfg.fields.map(f).join('')}</div>
     ${cfg.hintTop ? '' : '<div id="fhint" class="hint"></div>'}<div class="err" id="ferr"></div>
     <div class="frow"><button class="btn pri" type="submit">${esc(cfg.saveLabel || 'Save')}</button>${cfg.onDelete ? '<button type="button" class="btn danger" id="fdel">Delete</button>' : ''}</div></form></div>`;
   m.hidden = false;
@@ -646,13 +647,13 @@ function handleCode(code, kindHint) {
     onSave: o => ({ next: () => KINDS[o.kind].form(null, { barcode: code }) })
   });
 }
-function stockInForm(code, prod) {
+function stockInForm(code, prod, extra) {
   const K = KINDS[prod.kind];
   const items = S[K.col].filter(x => x.barcode === code);
   openForm({
     title: 'Stock in — ' + K.label, saveLabel: 'Add stock',
     intro: `<div class="card"><div class="ttl">${esc(K.namer({ ...prod.values, name: prod.values.name || prod.values.headstamp || '' }))}</div><div class="sub">Barcode ${esc(code)}</div></div>`,
-    values: { itemId: items.length ? items[items.length - 1].id : 'new', packs: 1, packQty: prod.packQty },
+    values: { itemId: items.length ? items[items.length - 1].id : 'new', packs: 1, packQty: prod.packQty, ...(extra || {}) },
     fields: [
       { k: 'itemId', label: 'Add to', type: 'select', noBlank: true, full: true, options: [...items.map(i => [i.id, K.namer(i) + (prod.kind !== 'powder' && i.lot ? ' · lot ' + i.lot : '')]), ['new', '+ New lot / new entry']] },
       { k: 'lot', label: 'Lot number on packet', full: true, help: 'For powder, a different lot always becomes a new entry' },
@@ -677,6 +678,91 @@ function stockInForm(code, prod) {
       return { go: prod.kind === 'brass' ? '#/brasslot/' + item.id : '#/' + K.col };
     }
   });
+}
+/* ---------- photo reading (Anthropic API, key kept on this device only) ---------- */
+async function kvGet(k) { try { const db = await idb(); return await new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); } catch (_) { try { return localStorage.getItem('rl-' + k); } catch (e) { return null; } } }
+async function kvSet(k, v) { try { const db = await idb(); await new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); } catch (_) { try { localStorage.setItem('rl-' + k, v); } catch (e) {} } }
+async function aiForm() {
+  const key = await kvGet('apikey');
+  openForm({
+    title: 'Photo reading (AI)', values: { key: key || '', model: S.settings.aiModel || 'claude-haiku-5-5' },
+    intro: `<div class="card sub">Reads packet labels from a photo using your own Anthropic API key. The key is stored <b>only on this device</b> — not on GitHub and not in backups. Set a monthly spend limit in the Anthropic console. Needs signal.</div>`,
+    fields: [
+      { k: 'key', label: 'Anthropic API key', type: 'password', full: true, ph: 'sk-ant-…' },
+      { k: 'model', label: 'Model', full: true, help: 'Default claude-haiku-5-5 (fast, cheapest). Try claude-sonnet-5-5 if labels are hard to read.' }
+    ],
+    onSave: async o => { await kvSet('apikey', o.key || ''); S.settings.aiModel = o.model || 'claude-haiku-5-5'; }
+  });
+}
+function resizeImage(file, max = 1568) {
+  return new Promise((res, rej) => {
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = () => {
+      const r = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas'); c.width = Math.round(img.width * r); c.height = Math.round(img.height * r);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+      res(c.toDataURL('image/jpeg', 0.85).split(',')[1]);
+    };
+    img.onerror = () => rej(new Error('Could not open the photo'));
+    img.src = url;
+  });
+}
+const AI_PROMPT = `This is a photo of a reloading component packet (bullets, powder, primers or cartridge brass). Read the label and reply with ONLY a JSON object, no other text:
+{"kind":"bullet|powder|primer|brass|unknown","maker":"","name":"product/model name","weight_gr":null,"diameter":"e.g. .308","bc":"e.g. G1 0.462","primer_type":"Small Rifle|Small Rifle Magnum|Large Rifle|Large Rifle Magnum|Small Pistol|Large Pistol|Other","calibre":"for brass, e.g. .308 Win","lot":"lot/batch number exactly as printed","quantity":null,"quantity_unit":"count|g|kg|lb","barcode":"digits under the barcode if legible"}
+Use null or "" for anything not visible. Do not guess lot numbers.`;
+async function readPacketPhoto(file, kindHint) {
+  const key = await kvGet('apikey');
+  if (!key) { alert('Add your Anthropic API key first (Setup → Photo reading).'); return aiForm(); }
+  const m = $('#modal');
+  m.innerHTML = `<div class="sheet"><div class="sheet-h"><h3>Reading packet…</h3><button type="button" data-close>✕</button></div><div class="empty">Reading the label — a few seconds.</div></div>`; m.hidden = false;
+  let d;
+  try {
+    const data = await resizeImage(file);
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+      body: JSON.stringify({ model: S.settings.aiModel || 'claude-haiku-5-5', max_tokens: 700, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }, { type: 'text', text: AI_PROMPT }] }] })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(r.status === 401 ? 'API key not accepted — check it under Setup → Photo reading.' : (j.error && j.error.message) || 'Request failed (' + r.status + ')');
+    const txt = (j.content || []).map(c => c.text || '').join('');
+    const mt = txt.match(/\{[\s\S]*\}/); if (!mt) throw new Error('Could not read the label. Try a sharper, closer photo.');
+    d = JSON.parse(mt[0]);
+  } catch (e) {
+    if ($('#modal').hidden) return;
+    m.innerHTML = `<div class="sheet"><div class="sheet-h"><h3>Couldn't read photo</h3><button type="button" data-close>✕</button></div><div class="alert bad">${esc(navigator.onLine === false ? 'No internet connection — photo reading needs signal.' : e.message)}</div></div>`;
+    return;
+  }
+  if ($('#modal').hidden) return; // cancelled while reading
+  closeModal();
+  applyPhotoData(d, kindHint);
+}
+function applyPhotoData(d, kindHint) {
+  const kind = KINDS[d.kind] ? d.kind : kindHint;
+  const q = num(d.quantity), unit = String(d.quantity_unit || '').toLowerCase();
+  const code = String(d.barcode || '').replace(/\D/g, '');
+  const intro = `<div class="alert">Read from photo — <b>check every field</b> before saving.</div>`;
+  if (code && S.products[code] && KINDS[S.products[code].kind]) return stockInForm(code, S.products[code], d.lot ? { lot: d.lot } : null);
+  if (!kind) {
+    return openForm({
+      title: 'What is it?', saveLabel: 'Next', intro: `<div class="alert">Couldn't tell what the packet is. Read: ${esc([d.maker, d.name, d.lot && 'lot ' + d.lot].filter(Boolean).join(' · ') || 'nothing clear')}</div>`,
+      fields: [{ k: 'kind', label: 'Type', type: 'select', req: true, full: true, options: Object.entries(KINDS).map(([k, K]) => [k, K.label]) }],
+      onSave: o => ({ next: () => applyPhotoData({ ...d, kind: o.kind }) })
+    });
+  }
+  const base = { _intro: intro, maker: d.maker || '', name: d.name || '', lot: d.lot || '', barcode: code };
+  let p;
+  if (kind === 'bullet') p = { ...base, weight: num(d.weight_gr), diameter: d.diameter || '', bc: d.bc || '', qtyBought: q, packQty: q };
+  if (kind === 'primer') p = { ...base, size: PRIMER_SIZES.some(x => x[0] === d.primer_type) ? d.primer_type : '', qtyBought: q, packQty: q };
+  if (kind === 'powder') { const g = q == null ? null : unit === 'kg' ? q * 1000 : unit === 'lb' ? Math.round(q * 453.59) : q; p = { ...base, grams: g, packQty: g }; }
+  if (kind === 'brass') p = { _intro: intro, barcode: code, headstamp: d.maker || '', calibre: d.calibre || '', count: q, packQty: q, name: `${d.maker || ''} ${d.calibre || ''} – Lot ${d.lot || 'A'}`.replace(/\s+/g, ' ').trim(), notes: d.lot ? 'Maker lot ' + d.lot : '' };
+  KINDS[kind].form(null, p);
+}
+function pickPhoto(kindHint) {
+  let inp = $('#photofile');
+  if (!inp) { inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'; inp.setAttribute('capture', 'environment'); inp.id = 'photofile'; inp.hidden = true; document.body.appendChild(inp); }
+  inp.onchange = () => { const f = inp.files[0]; inp.value = ''; if (f) readPacketPhoto(f, kindHint); };
+  inp.click();
 }
 function settingsForm() {
   openForm({
@@ -821,7 +907,7 @@ const views = {
   brass() {
     const act = S.brass.filter(b => !b.retired), ret = S.brass.filter(b => b.retired);
     const cals = [...new Set(act.map(b => (b.calibre || 'Other').trim()))].sort();
-    return `<div class="btns"><button class="btn pri" data-act="newBrass">+ New brass lot</button><button class="btn" data-act="scan" data-kind="brass">▦ Scan</button></div>
+    return `<div class="btns"><button class="btn pri" data-act="newBrass">+ New brass lot</button><button class="btn" data-act="scan" data-kind="brass">▦ Scan</button><button class="btn" data-act="photo" data-kind="brass">📷 Photo</button></div>
       ${cals.map(c => { const lots = act.filter(b => (b.calibre || 'Other').trim() === c).sort((a, b) => a.name.localeCompare(b.name)); return `<h2>${esc(c)} — ${lots.length} lot(s), ${lots.reduce((a, b) => a + (+b.count || 0), 0)} cases</h2>${lots.map(brassCard).join('')}`; }).join('') || empty('No brass lots yet.')}
       ${ret.length ? `<h2>Retired</h2>${ret.map(brassCard).join('')}` : ''}`;
   },
@@ -838,11 +924,11 @@ const views = {
   },
   setup() {
     const it = (href, t, n) => card(href, `<div class="row"><div class="grow ttl">${t}</div><span class="sub">${n} ›</span></div>`);
-    return `<div class="btns"><button class="btn pri" data-act="scan">▦ Scan packet barcode</button></div>
+    return `<div class="btns"><button class="btn pri" data-act="scan">▦ Scan barcode</button><button class="btn pri" data-act="photo">📷 Photo of packet</button></div>
       <h2>Equipment &amp; components</h2>
       ${it('#/rifles', 'Rifles', S.rifles.length)}${it('#/bullets', 'Bullets', S.bullets.length)}${it('#/powders', 'Powders', S.powders.length)}${it('#/primers', 'Primers', S.primers.length)}${it('#/brass', 'Brass lots', S.brass.length)}
       <h2>App</h2>
-      <div class="btns"><button class="btn" data-act="settings">Settings &amp; brass rules</button></div>
+      <div class="btns"><button class="btn" data-act="settings">Settings &amp; brass rules</button><button class="btn" data-act="ai">Photo reading (AI key)</button></div>
       <h2>Backup</h2>
       <div class="card sub">Your data is stored only on this device. Export a backup regularly (save it to OneDrive/Google Drive) — and use it to move data to another phone or PC.</div>
       <div class="btns"><button class="btn pri" data-act="export">Export backup</button><button class="btn" data-act="import">Import backup</button><button class="btn" data-act="csv">Export range data (CSV)</button></div>
@@ -853,13 +939,13 @@ const views = {
     return `<div class="btns"><button class="btn pri" data-act="newRifle">+ New rifle</button></div>${S.rifles.map(r => `<div class="card" data-act="editRifle" data-id="${r.id}" style="cursor:pointer"><div class="ttl">${esc(r.name)}</div><div class="sub">${esc([r.calibre, r.twist && 'twist ' + r.twist, r.barrel, r.optic].filter(Boolean).join(' · '))}</div><div class="kv"><div>Round count<b>${rifleRounds(r)}</b></div><div>Loads<b>${S.loads.filter(l => l.rifleId === r.id).length}</b></div></div></div>`).join('') || empty('No rifles yet.')}`;
   },
   bullets() {
-    return `<div class="btns"><button class="btn pri" data-act="newBullet">+ New bullet</button><button class="btn" data-act="scan" data-kind="bullet">▦ Scan</button></div>${S.bullets.map(b => stockCard('editBullet', b.id, nBullet(b), [b.diameter, b.bc, b.lot && 'lot ' + b.lot, unitPrice(b) != null && money(unitPrice(b)) + ' each'], bulletLeft(b), +b.qtyBought || 0, '')).join('') || empty('No bullets yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newBullet">+ New bullet</button><button class="btn" data-act="scan" data-kind="bullet">▦ Scan</button><button class="btn" data-act="photo" data-kind="bullet">📷 Photo</button></div>${S.bullets.map(b => stockCard('editBullet', b.id, nBullet(b), [b.diameter, b.bc, b.lot && 'lot ' + b.lot, unitPrice(b) != null && money(unitPrice(b)) + ' each'], bulletLeft(b), +b.qtyBought || 0, '')).join('') || empty('No bullets yet.')}`;
   },
   powders() {
-    return `<div class="btns"><button class="btn pri" data-act="newPowder">+ New powder</button><button class="btn" data-act="scan" data-kind="powder">▦ Scan</button></div>${S.powders.map(p => stockCard('editPowder', p.id, nPowder(p), [unitPrice(p) != null && money(unitPrice(p) * 1000) + ' per kg'], powderLeft(p), +p.grams || 0, ' g')).join('') || empty('No powders yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newPowder">+ New powder</button><button class="btn" data-act="scan" data-kind="powder">▦ Scan</button><button class="btn" data-act="photo" data-kind="powder">📷 Photo</button></div>${S.powders.map(p => stockCard('editPowder', p.id, nPowder(p), [unitPrice(p) != null && money(unitPrice(p) * 1000) + ' per kg'], powderLeft(p), +p.grams || 0, ' g')).join('') || empty('No powders yet.')}`;
   },
   primers() {
-    return `<div class="btns"><button class="btn pri" data-act="newPrimer">+ New primer</button><button class="btn" data-act="scan" data-kind="primer">▦ Scan</button></div>${S.primers.map(p => stockCard('editPrimer', p.id, nPrimer(p), [p.size, p.lot && 'lot ' + p.lot, unitPrice(p) != null && money(unitPrice(p)) + ' each'], primerLeft(p), +p.qtyBought || 0, '')).join('') || empty('No primers yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newPrimer">+ New primer</button><button class="btn" data-act="scan" data-kind="primer">▦ Scan</button><button class="btn" data-act="photo" data-kind="primer">📷 Photo</button></div>${S.primers.map(p => stockCard('editPrimer', p.id, nPrimer(p), [p.size, p.lot && 'lot ' + p.lot, unitPrice(p) != null && money(unitPrice(p)) + ' each'], primerLeft(p), +p.qtyBought || 0, '')).join('') || empty('No primers yet.')}`;
   }
 };
 function stockCard(act, id, title, sub, left, total, unit) {
@@ -955,6 +1041,8 @@ const ACTIONS = {
   newPrimer: () => primerForm(), editPrimer: d => primerForm(get('primers', d.id)),
   settings: () => settingsForm(),
   scan: d => openScanner(handleCode, d.kind),
+  photo: d => pickPhoto(d.kind),
+  ai: () => aiForm(),
   export: () => download(`reload-log-backup-${today()}.json`, JSON.stringify({ ...S, exported: new Date().toISOString(), app: APP_VERSION }, null, 1), 'application/json'),
   import: () => $('#importfile').click(),
   csv: () => csvExport()
