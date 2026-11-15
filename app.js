@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.10.0';
+const APP_VERSION = '1.11.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -113,12 +113,36 @@ async function save() {
   clearTimeout(save._t); save._t = setTimeout(() => el.textContent = '', 1500);
 }
 
-/* ---------- units ---------- */
-const inch = () => S.settings.lenUnit === 'in';
-const unitLbl = () => inch() ? 'in' : 'mm';
-const toDisp = mm => mm == null ? '' : inch() ? +(mm / 25.4).toFixed(4) : +(+mm).toFixed(3);
-const fromDisp = v => inch() ? v * 25.4 : v;
-const fLen = mm => mm == null ? '–' : inch() ? (mm / 25.4).toFixed(3) + '"' : (+mm).toFixed(2) + ' mm';
+/* ---------- units ----------
+   Everything is stored in one base unit (mm, m/s, m, °C, hPa) and shown/entered in the unit chosen per measurement in Settings. */
+const UNITS = {
+  len: { key: 'lenUnit', def: 'mm', label: 'Cartridge & case lengths (COAL, CBTO, trim)', opts: { mm: ['mm', 1, 2], in: ['in', 25.4, 3] } },
+  barrel: { key: 'barrelUnit', def: 'in', label: 'Barrel length', opts: { in: ['in', 25.4, 1], mm: ['mm', 1, 0] } },
+  vel: { key: 'velUnit', def: 'ms', label: 'Velocity', opts: { ms: ['m/s', 1, 0], fps: ['fps', 0.3048, 0] } },
+  dist: { key: 'distUnit', def: 'm', label: 'Range distance', opts: { m: ['m', 1, 0], yd: ['yd', 0.9144, 0] } },
+  group: { key: 'groupUnit', def: 'mm', label: 'Group size', opts: { mm: ['mm', 1, 0], in: ['in', 25.4, 2] } },
+  temp: { key: 'tempUnit', def: 'C', label: 'Temperature', opts: { C: ['°C', 1, 0], F: ['°F', 1, 0] } },
+  alt: { key: 'altUnit', def: 'm', label: 'Altitude', opts: { m: ['m', 1, 0], ft: ['ft', 0.3048, 0] } },
+  press: { key: 'pressUnit', def: 'hPa', label: 'Air pressure', opts: { hPa: ['hPa', 1, 0], inHg: ['inHg', 33.8639, 2] } }
+};
+const uCur = dim => { const U = UNITS[dim], c = S.settings[U.key]; return U.opts[c] ? c : U.def; };
+const uLbl = dim => UNITS[dim].opts[uCur(dim)][0];
+function toU(dim, base, unit = uCur(dim)) {
+  if (base == null || base === '' || isNaN(base)) return null; base = +base;
+  if (dim === 'temp') return unit === 'F' ? base * 9 / 5 + 32 : base;
+  return base / UNITS[dim].opts[unit][1];
+}
+function fromU(dim, v, unit = uCur(dim)) {
+  if (v == null || v === '' || isNaN(v)) return null; v = +v;
+  if (dim === 'temp') return unit === 'F' ? (v - 32) * 5 / 9 : v;
+  return v * UNITS[dim].opts[unit][1];
+}
+const fU = (dim, base, withUnit = true) => { const v = toU(dim, base); return v == null ? '–' : v.toFixed(UNITS[dim].opts[uCur(dim)][2]) + (withUnit ? (dim === 'temp' ? '' : ' ') + uLbl(dim) : ''); };
+const inch = () => uCur('len') === 'in';
+const unitLbl = () => uLbl('len');
+const toDisp = mm => mm == null ? '' : +toU('len', mm).toFixed(4);
+const fromDisp = v => fromU('len', v);
+const fLen = mm => fU('len', mm);
 
 /* ---------- names ---------- */
 const nRifle = r => r ? r.name + (r.calibre ? ` (${r.calibre})` : '') : '?';
@@ -129,6 +153,15 @@ const nPrimer = p => p ? `${p.maker || ''} ${p.name || ''}`.trim() : '?';
 const brassTitle = b => b ? [b.userLot != null && b.userLot !== '' ? 'Lot ' + b.userLot : null, [b.headstamp, b.calibre].filter(Boolean).join(' ') || null, b.name || null].filter(Boolean).join(' · ') || 'Brass' : '?';
 const nBrass = b => b ? brassTitle(b) + (b.mark ? ` [${b.mark}]` : '') : '?';
 const nextUserLot = () => S.brass.reduce((m, b) => Math.max(m, +b.userLot || 0), 0) + 1;
+function migrateUnits() {
+  S.rifles.forEach(r => {
+    if (r.barrelLen == null && r.barrel) { const m = String(r.barrel).match(/(\d+(?:[.,]\d+)?)/); if (m) { const v = parseFloat(m[1].replace(',', '.')); r.barrelLen = /mm/i.test(r.barrel) || v > 60 ? v : v * 25.4; delete r.barrel; } }
+  });
+  S.loads.forEach(l => {
+    if (l.velUnit === 'fps') { testsOf(l).forEach(t => { if (t.vel != null) t.vel = t.vel * 0.3048; }); if (l.provenVel != null) l.provenVel *= 0.3048; }
+    delete l.velUnit;
+  });
+}
 function numberBrass() { [...S.brass].sort((a, b) => (a.created || 0) - (b.created || 0)).forEach(b => { if (b.userLot == null || b.userLot === '') b.userLot = nextUserLot(); }); }
 const nLoad = l => l ? (l.name || `${fx(l.charge, 1)}gr ${nPowder(get('powders', l.powderId))}`) : '?';
 const nBatch = b => { if (!b) return '?'; const l = get('loads', b.loadId); return `${b.date} · ${nLoad(l)}`; };
@@ -307,6 +340,8 @@ function brassState(br) {
 }
 
 function parseVels(txt) { return String(txt || '').split(/[\s,;]+/).map(Number).filter(v => v > 0); }
+/* A string's velocities converted to the velocity unit chosen in Settings (each string remembers the unit it was typed in). */
+const stringVels = st => parseVels(st.vels).map(v => toU('vel', fromU('vel', v, st.velUnit || 'ms')));
 function stats(vels) {
   const n = vels.length; if (!n) return { n: 0 };
   const avg = vels.reduce((a, b) => a + b, 0) / n;
@@ -319,7 +354,7 @@ function mil(groupMm, distM) { return groupMm && distM ? groupMm / distM : null;
 function loadStrings(loadId) { return allStrings().filter(st => { const b = get('batches', st.batchId); return b && b.loadId === loadId; }); }
 function loadSummary(loadId) {
   const strs = loadStrings(loadId);
-  const vels = strs.flatMap(st => parseVels(st.vels));
+  const vels = strs.flatMap(st => stringVels(st));
   const s = stats(vels);
   const moas = strs.map(st => moa(st.groupMm, st.session.distance)).filter(x => x);
   return { ...s, strings: strs.length, shots: strs.reduce((a, st) => a + (+st.shots || 0), 0), bestMoa: moas.length ? Math.min(...moas) : null, avgMoa: moas.length ? moas.reduce((a, b) => a + b, 0) / moas.length : null };
@@ -338,14 +373,14 @@ function openForm(cfg) {
         inp = `<select name="${fd.k}">${fd.noBlank ? '' : '<option value="">—</option>'}${fd.options.map(([o, l]) => `<option value="${esc(o)}"${String(o) === String(val ?? '') ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`; break;
       case 'textarea': inp = `<textarea name="${fd.k}" placeholder="${esc(fd.ph || '')}">${esc(val)}</textarea>`; break;
       case 'check': return `<label class="chk full" style="grid-column:1/-1"><input type="checkbox" name="${fd.k}"${val ? ' checked' : ''}> ${esc(fd.label)}</label>`;
-      case 'len': inp = `<input name="${fd.k}" type="number" step="any" inputmode="decimal" value="${esc(toDisp(val ?? null))}" placeholder="${esc(fd.ph || '')}">`; break;
+      case 'len': case 'u': { const dm = fd.type === 'len' ? 'len' : fd.dim, dv = toU(dm, val ?? null); inp = `<input name="${fd.k}" type="number" step="any" inputmode="decimal" value="${dv == null ? '' : +dv.toFixed(4)}" placeholder="${esc(fd.ph || '')}">`; break; }
       case 'num': inp = `<input name="${fd.k}" type="number" step="any" inputmode="decimal" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`; break;
       case 'date': inp = `<input name="${fd.k}" type="date" value="${esc(val || (fd.noDefault ? '' : today()))}">`; break;
       case 'password': inp = `<input name="${fd.k}" type="password" autocomplete="off" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`; break;
       default: inp = `<input name="${fd.k}" type="text" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`;
         if (fd.photo) inp = `<div class="row" style="flex-wrap:nowrap">${inp}<button type="button" class="btn sm" style="white-space:nowrap;flex:none" data-act="lotPhoto" data-k="${fd.k}" title="Photograph the lot number">📷 Lot</button></div>`;
     }
-    return `<label class="${cls}"><span>${esc(fd.label)}${fd.type === 'len' ? ` (${unitLbl()})` : ''}${fd.req ? ' *' : ''}</span>${inp}${fd.help ? `<small>${esc(fd.help)}</small>` : ''}</label>`;
+    return `<label class="${cls}"><span>${esc(fd.label)}${fd.type === 'len' ? ` (${unitLbl()})` : fd.type === 'u' ? ` (${uLbl(fd.dim)})` : ''}${fd.req ? ' *' : ''}</span>${inp}${fd.help ? `<small>${esc(fd.help)}</small>` : ''}</label>`;
   };
   const m = $('#modal');
   m.innerHTML = `<div class="sheet"><div class="sheet-h"><h3>${esc(cfg.title)}</h3><button type="button" data-close aria-label="Close">✕</button></div>
@@ -362,6 +397,7 @@ function openForm(cfg) {
       if (fd.type === 'check') o[fd.k] = el.checked;
       else if (fd.type === 'num') o[fd.k] = num(el.value);
       else if (fd.type === 'len') o[fd.k] = el.value === '' ? null : fromDisp(+el.value);
+      else if (fd.type === 'u') o[fd.k] = el.value === '' ? null : fromU(fd.dim, +el.value);
       else o[fd.k] = el.value.trim();
     });
     return o;
@@ -412,7 +448,7 @@ function rifleForm(r) {
       { k: 'name', label: 'Name', req: true, full: true, ph: 'e.g. Tikka T3x 308' },
       { k: 'calibre', label: 'Calibre', req: true, ph: '.308 Win' },
       { k: 'twist', label: 'Twist rate', ph: '1:10' },
-      { k: 'barrel', label: 'Barrel length', ph: '24 in' },
+      { k: 'barrelLen', label: 'Barrel length', type: 'u', dim: 'barrel' },
       { k: 'initRounds', label: 'Rounds fired before app', type: 'num', def: 0 },
       { k: 'optic', label: 'Scope / optic', full: true },
       { k: 'notes', label: 'Notes (throat, chamber, etc.)', type: 'textarea' }
@@ -663,11 +699,11 @@ function sessionForm(s) {
       { k: 'date', label: 'Date', type: 'date' },
       { k: 'rifleId', label: 'Rifle', type: 'select', req: true, options: opts('rifles', nRifle) },
       { k: 'location', label: 'Range / location', full: true },
-      { k: 'distance', label: 'Distance (m)', type: 'num', req: true },
-      { k: 'tempC', label: 'Temp (°C)', type: 'num' },
-      { k: 'pressure', label: 'Pressure (hPa)', type: 'num' },
+      { k: 'distance', label: 'Distance', type: 'u', dim: 'dist', req: true },
+      { k: 'tempC', label: 'Temp', type: 'u', dim: 'temp' },
+      { k: 'pressure', label: 'Pressure', type: 'u', dim: 'press' },
       { k: 'humidity', label: 'Humidity (%)', type: 'num' },
-      { k: 'altitude', label: 'Altitude (m)', type: 'num' },
+      { k: 'altitude', label: 'Altitude', type: 'u', dim: 'alt' },
       { k: 'wind', label: 'Wind', ph: '3 m/s from 9 o\'clock' },
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
@@ -682,13 +718,12 @@ function stringForm(sess, st) {
   const list = preferred.length ? preferred : avail;
   if (!list.length) { alert('No loaded rounds available. Load a batch first.'); return; }
   openForm({
-    title: st ? 'Edit string' : 'Record a string / group', values: st,
+    title: st ? 'Edit string' : 'Record a string / group', values: st ? { ...st, vels: (st.velUnit || 'ms') === uCur('vel') ? st.vels : stringVels(st).map(v => Math.round(v * 10) / 10).join(' ') } : null,
     fields: [
       { k: 'batchId', label: 'Ammo batch', type: 'select', req: true, full: true, options: list.map(b => [b.id, `${nBatch(b)} (${batchLeft(b) + (st && st.batchId === b.id ? +st.shots || 0 : 0)} left)`]) },
-      { k: 'vels', label: 'Velocities (m/s or fps)', type: 'textarea', ph: 'e.g. 812 818 809 815 811 — paste from your chrono' },
+      { k: 'vels', label: `Velocities (${uLbl('vel')})`, type: 'textarea', ph: 'e.g. 812 818 809 815 811 — paste from your chrono' },
       { k: 'shots', label: 'Shots fired', type: 'num', help: 'Leave blank to count the velocities' },
-      { k: 'groupMm', label: 'Group size (mm)', type: 'num', help: 'Centre-to-centre' },
-      { k: 'velUnit', label: 'Velocity unit', type: 'select', options: [['ms', 'm/s'], ['fps', 'fps']], noBlank: true, def: S.settings.velUnit || 'ms' },
+      { k: 'groupMm', label: 'Group size', type: 'u', dim: 'group', help: 'Centre-to-centre' },
       { k: 'poi', label: 'POI / clicks', ph: '0.3 mil up' },
       { k: 'pressureSigns', label: 'Pressure signs seen', type: 'check' },
       { k: 'notes', label: 'Notes', type: 'textarea' }
@@ -706,7 +741,7 @@ function stringForm(sess, st) {
       const b = get('batches', o.batchId);
       const left = (+b.qty || 0) - batchFired(b.id, st && st.id);
       if (o.shots > left) return `Only ${left} rounds left in that batch.`;
-      S.settings.velUnit = o.velUnit;
+      o.velUnit = uCur('vel');
       if (st) Object.assign(st, o); else sess.strings.push({ id: uid(), created: Date.now(), ...o });
     },
     onDelete: st && (() => { sess.strings = sess.strings.filter(x => x.id !== st.id); })
@@ -970,8 +1005,9 @@ function settingsForm() {
   openForm({
     title: 'Settings', values: S.settings,
     fields: [
-      { k: 'lenUnit', label: 'Length unit', type: 'select', noBlank: true, options: [['mm', 'Millimetres'], ['in', 'Inches']] },
-      { k: 'distance', label: 'Default distance (m)', type: 'num' },
+      { type: 'section', label: 'Units — choose per measurement' },
+      ...Object.entries(UNITS).map(([dim, U]) => ({ k: U.key, label: U.label, type: 'select', noBlank: true, def: U.def, options: Object.entries(U.opts).map(([k, o]) => [k, o[0]]) })),
+      { k: 'distance', label: 'Default distance', type: 'u', dim: 'dist' },
       { type: 'section', label: 'Default brass rules' },
       { k: 'flAfter', label: 'FL resize after N neck sizes', type: 'num' },
       { k: 'annealEvery', label: 'Anneal every N firings', type: 'num' },
@@ -994,9 +1030,9 @@ const statusPill = s => s === 'proven' ? pill('ok', 'Proven') : s === 'rejected'
 const empty = t => `<div class="empty">${t}</div>`;
 const card = (go, inner) => `<a class="card" href="${go}">${inner}</a>`;
 
-/* ---------- velocity tests (development) & approved velocity (proven) ---------- */
+/* ---------- velocity tests (development) & approved velocity (proven) — stored as m/s and °C ---------- */
 const TEST_SLOTS = 5;
-const velU = () => S.settings.velUnit === 'fps' ? 'fps' : 'm/s';
+const velU = () => uLbl('vel');
 function seasonOf(date) { // Southern hemisphere
   const m = +(String(date || '').slice(5, 7)); if (!m) return '';
   return m === 12 || m <= 2 ? 'Summer' : m <= 5 ? 'Autumn' : m <= 8 ? 'Winter' : 'Spring';
@@ -1010,14 +1046,14 @@ function velTestsForm(l) {
     { type: 'section', label: `Test ${i}` },
     { k: `t${i}_date`, label: 'Date', type: 'date', noDefault: true },
     { k: `t${i}_season`, label: 'Time of year', ph: 'auto from date' },
-    { k: `t${i}_vel`, label: `Speed (${velU()})`, type: 'num' },
-    { k: `t${i}_ammoTemp`, label: 'Ammo / powder temp (°C)', type: 'num' },
-    { k: `t${i}_airTemp`, label: 'Air temp (°C)', type: 'num' },
+    { k: `t${i}_vel`, label: 'Speed', type: 'u', dim: 'vel' },
+    { k: `t${i}_ammoTemp`, label: 'Ammo / powder temp', type: 'u', dim: 'temp' },
+    { k: `t${i}_airTemp`, label: 'Air temp', type: 'u', dim: 'temp' },
     { k: `t${i}_humidity`, label: 'Humidity (%)', type: 'num' });
   openForm({
     title: 'Velocity tests — ' + nLoad(l), values: v, fields,
     intro: `<div class="card sub">Up to ${TEST_SLOTS} tests while developing this load. Speed = average of that test's string. Time of year fills in from the date.</div>`,
-    hint: o => { const vs = []; for (let i = 1; i <= TEST_SLOTS; i++) if (o[`t${i}_vel`] > 0) vs.push(o[`t${i}_vel`]); if (!vs.length) return ''; const s = stats(vs); return `<div class="card kv"><div>Tests<b>${s.n}</b></div><div>Average<b>${fx(s.avg, 0)} ${velU()}</b></div><div>Spread<b>${fx(s.es, 0)}</b></div></div>`; },
+    hint: o => { const vs = []; for (let i = 1; i <= TEST_SLOTS; i++) if (o[`t${i}_vel`] > 0) vs.push(toU('vel', o[`t${i}_vel`])); if (!vs.length) return ''; const s = stats(vs); return `<div class="card kv"><div>Tests<b>${s.n}</b></div><div>Average<b>${fx(s.avg, 0)} ${velU()}</b></div><div>Spread<b>${fx(s.es, 0)}</b></div></div>`; },
     onSave: o => {
       const tests = [];
       for (let i = 1; i <= TEST_SLOTS; i++) {
@@ -1026,7 +1062,7 @@ function velTestsForm(l) {
         if (!t.season && t.date) t.season = seasonOf(t.date);
         tests.push(t);
       }
-      l.tests = tests; l.velUnit = velU();
+      l.tests = tests;
     }
   });
 }
@@ -1034,29 +1070,29 @@ function approvedVelForm(l) {
   const avg = testsAvg(l);
   openForm({
     title: 'Approved velocity — ' + nLoad(l),
-    values: { provenVel: l.provenVel ?? (avg != null ? Math.round(avg) : null), provenTemp: l.provenTemp, provenDate: l.provenDate },
+    values: { provenVel: l.provenVel ?? avg, provenTemp: l.provenTemp, provenDate: l.provenDate },
     intro: avg != null && l.provenVel == null ? `<div class="alert ok">Filled in from the average of your ${testsOf(l).length} development test(s) — change if needed.</div>` : '',
     fields: [
-      { k: 'provenVel', label: `Average speed (${velU()})`, type: 'num', req: true },
-      { k: 'provenTemp', label: 'Measured at temperature (°C)', type: 'num', req: true },
+      { k: 'provenVel', label: 'Average speed', type: 'u', dim: 'vel', req: true },
+      { k: 'provenTemp', label: 'Measured at temperature', type: 'u', dim: 'temp', req: true },
       { k: 'provenDate', label: 'Date measured', type: 'date', noDefault: true }
     ],
-    onSave: o => { Object.assign(l, o); l.velUnit = velU(); }
+    onSave: o => { Object.assign(l, o); }
   });
 }
 function velSection(l) {
-  const u = l.velUnit || velU(), tests = testsOf(l);
+  const tests = testsOf(l);
   const approved = `<h2>Approved velocity</h2>${l.provenVel != null
-    ? `<div class="card kv" style="margin-top:0" data-act="approvedVel" data-id="${l.id}"><div>Average speed<b>${fx(l.provenVel, 0)} ${u}</b></div><div>At temperature<b>${l.provenTemp != null ? l.provenTemp + ' °C' : '–'}</b></div><div>Date<b>${esc(l.provenDate || '–')}</b></div></div>`
+    ? `<div class="card kv" style="margin-top:0" data-act="approvedVel" data-id="${l.id}"><div>Average speed<b>${fU('vel', l.provenVel)}</b></div><div>At temperature<b>${fU('temp', l.provenTemp)}</b></div><div>Date<b>${esc(l.provenDate || '–')}</b></div></div>`
     : empty('Not recorded yet.')}<div class="btns"><button class="btn${l.status === 'proven' ? ' pri' : ''}" data-act="approvedVel" data-id="${l.id}">${l.provenVel != null ? 'Edit' : 'Record'} approved velocity</button></div>`;
-  const devTable = `<h2>Velocity tests (${tests.length}/${TEST_SLOTS})</h2>${tests.length ? `<div class="tblwrap"><table><tr><th>#</th><th>Date</th><th>Season</th><th>Speed</th><th>Ammo °C</th><th>Air °C</th><th>Hum %</th></tr>${tests.map((t, i) => `<tr><td>${i + 1}</td><td>${esc(t.date || '')}</td><td>${esc(t.season || '')}</td><td>${fx(t.vel, 0)}</td><td>${t.ammoTemp ?? ''}</td><td>${t.airTemp ?? ''}</td><td>${t.humidity ?? ''}</td></tr>`).join('')}<tr><td></td><td colspan="2"><b>Average</b></td><td><b>${fx(testsAvg(l), 0)}</b></td><td colspan="3">${u}</td></tr></table></div>` : empty('No tests recorded yet.')}<div class="btns"><button class="btn${l.status !== 'proven' ? ' pri' : ''}" data-act="velTests" data-id="${l.id}">${tests.length ? 'Edit' : 'Enter'} velocity tests</button></div>`;
+  const devTable = `<h2>Velocity tests (${tests.length}/${TEST_SLOTS})</h2>${tests.length ? `<div class="tblwrap"><table><tr><th>#</th><th>Date</th><th>Season</th><th>Speed ${velU()}</th><th>Ammo ${uLbl('temp')}</th><th>Air ${uLbl('temp')}</th><th>Hum %</th></tr>${tests.map((t, i) => `<tr><td>${i + 1}</td><td>${esc(t.date || '')}</td><td>${esc(t.season || '')}</td><td>${fU('vel', t.vel, false)}</td><td>${t.ammoTemp != null ? fU('temp', t.ammoTemp, false) : ''}</td><td>${t.airTemp != null ? fU('temp', t.airTemp, false) : ''}</td><td>${t.humidity ?? ''}</td></tr>`).join('')}<tr><td></td><td colspan="2"><b>Average</b></td><td><b>${fU('vel', testsAvg(l), false)}</b></td><td colspan="3"></td></tr></table></div>` : empty('No tests recorded yet.')}<div class="btns"><button class="btn${l.status !== 'proven' ? ' pri' : ''}" data-act="velTests" data-id="${l.id}">${tests.length ? 'Edit' : 'Enter'} velocity tests</button></div>`;
   return l.status === 'proven' ? approved + (tests.length ? devTable : '') : devTable + (l.provenVel != null ? approved : '');
 }
 function loadCard(l) {
   const s = loadSummary(l.id);
   return card('#/load/' + l.id, `<div class="row"><div class="grow ttl">${esc(nLoad(l))}</div>${statusPill(l.status)}</div>
     <div class="sub">${esc(nRifle(get('rifles', l.rifleId)))} · ${esc(nBullet(get('bullets', l.bulletId)))}</div>
-    <div class="kv"><div>Charge<b>${fx(l.charge, 2)} gr</b></div><div>CBTO<b>${fLen(l.cbto)}</b></div><div>${l.provenVel != null ? 'Approved speed' : 'Avg vel / SD'}<b>${l.provenVel != null ? fx(l.provenVel, 0) + ' ' + (l.velUnit || velU()) + (l.provenTemp != null ? ' @ ' + l.provenTemp + '°C' : '') : s.n ? fx(s.avg, 0) + ' / ' + fx(s.sd, 1) : testsAvg(l) != null ? fx(testsAvg(l), 0) + ' (tests)' : '–'}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Cost / round<b>${money(roundCost(l)?.total)}</b></div></div>`);
+    <div class="kv"><div>Charge<b>${fx(l.charge, 2)} gr</b></div><div>CBTO<b>${fLen(l.cbto)}</b></div><div>${l.provenVel != null ? 'Approved speed' : 'Avg vel / SD'}<b>${l.provenVel != null ? fU('vel', l.provenVel) + (l.provenTemp != null ? ' @ ' + fU('temp', l.provenTemp) : '') : s.n ? fx(s.avg, 0) + ' / ' + fx(s.sd, 1) : testsAvg(l) != null ? fU('vel', testsAvg(l)) + ' (tests)' : '–'}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Cost / round<b>${money(roundCost(l)?.total)}</b></div></div>`);
 }
 
 const views = {
@@ -1114,7 +1150,7 @@ const views = {
       <h2>Cost per round (current prices)</h2>${costBreakdown(roundCost(l))}
       <h2>Performance</h2>
       <div class="card kv" style="margin-top:0"><div>Shots<b>${s.shots}</b></div><div>Avg vel<b>${fx(s.avg, 0)}</b></div><div>ES (all)<b>${fx(s.es, 0)}</b></div><div>SD (all)<b>${fx(s.sd, 1)}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Avg group<b>${s.avgMoa ? fx(s.avgMoa, 2) + ' MOA' : '–'}</b></div></div>
-      ${strs.length ? `<div class="tblwrap"><table><tr><th>Date</th><th>Dist</th><th>Shots</th><th>Avg</th><th>ES</th><th>SD</th><th>Group</th><th>MOA</th></tr>${strs.map(st => { const v = stats(parseVels(st.vels)); return `<tr data-go="#/session/${st.session.id}"><td>${esc(st.session.date)}</td><td>${esc(st.session.distance)}m</td><td>${st.shots}</td><td>${fx(v.avg, 0)}</td><td>${fx(v.es, 0)}</td><td>${fx(v.sd, 1)}</td><td>${st.groupMm ? fx(st.groupMm, 0) + 'mm' : '–'}</td><td>${fx(moa(st.groupMm, st.session.distance), 2)}${st.pressureSigns ? ' ⚠' : ''}</td></tr>`; }).join('')}</table></div>` : empty('Not shot yet.')}
+      ${strs.length ? `<div class="tblwrap"><table><tr><th>Date</th><th>Dist</th><th>Shots</th><th>Avg</th><th>ES</th><th>SD</th><th>Group</th><th>MOA</th></tr>${strs.map(st => { const v = stats(stringVels(st)); return `<tr data-go="#/session/${st.session.id}"><td>${esc(st.session.date)}</td><td>${fU('dist', st.session.distance)}</td><td>${st.shots}</td><td>${fx(v.avg, 0)}</td><td>${fx(v.es, 0)}</td><td>${fx(v.sd, 1)}</td><td>${st.groupMm ? fU('group', st.groupMm) : '–'}</td><td>${fx(moa(st.groupMm, st.session.distance), 2)}${st.pressureSigns ? ' ⚠' : ''}</td></tr>`; }).join('')}</table></div>` : empty('Not shot yet.')}
       <h2>Batches</h2>${batches.map(batchCard).join('') || empty('No batches loaded.')}`;
   },
   series(q, tag) {
@@ -1171,7 +1207,7 @@ const views = {
       ${b.notes ? `<div class="note">${esc(b.notes)}</div>` : ''}</div>
       <div class="btns"><a class="btn" href="#/load/${b.loadId}" style="text-decoration:none;text-align:center">View load</a><button class="btn" data-act="editBatch" data-id="${b.id}">Edit</button></div>
       <h2>Cost</h2>${(c => costBreakdown(c, c && c.total != null ? `<div>Whole batch<b>${money(c.total * (+b.qty || 0))}</b></div><div>Fired so far<b>${money(c.total * batchFired(b.id))}</b></div>` : ''))(batchCost(b))}
-      <h2>Shot at the range</h2>${strs.map(st => card('#/session/' + st.session.id, `<div class="ttl">${esc(st.session.date)} · ${esc(st.session.distance)}m</div><div class="sub">${st.shots} shots${st.groupMm ? ` · ${fx(moa(st.groupMm, st.session.distance), 2)} MOA` : ''}</div>`)).join('') || empty('Not fired yet.')}`;
+      <h2>Shot at the range</h2>${strs.map(st => card('#/session/' + st.session.id, `<div class="ttl">${esc(st.session.date)} · ${fU('dist', st.session.distance)}</div><div class="sub">${st.shots} shots${st.groupMm ? ` · ${fx(moa(st.groupMm, st.session.distance), 2)} MOA` : ''}</div>`)).join('') || empty('Not fired yet.')}`;
   },
   range() {
     return `<div class="btns"><button class="btn pri" data-act="newSession">+ New range session</button></div>
@@ -1180,13 +1216,13 @@ const views = {
   session(q, id) {
     const s = get('sessions', id); if (!s) return empty('Session not found.');
     return `<div class="card"><div class="ttl">${esc(s.date)} · ${esc(nRifle(get('rifles', s.rifleId)))}</div><div class="sub">${esc(s.location || '')}</div>
-      <div class="kv"><div>Distance<b>${esc(s.distance)} m</b></div><div>Temp<b>${s.tempC != null ? s.tempC + ' °C' : '–'}</b></div><div>Pressure<b>${s.pressure != null ? s.pressure + ' hPa' : '–'}</b></div><div>Humidity<b>${s.humidity != null ? s.humidity + '%' : '–'}</b></div><div>Altitude<b>${s.altitude != null ? s.altitude + ' m' : '–'}</b></div><div>Wind<b>${esc(s.wind || '–')}</b></div></div>
+      <div class="kv"><div>Distance<b>${fU('dist', s.distance)}</b></div><div>Temp<b>${fU('temp', s.tempC)}</b></div><div>Pressure<b>${fU('press', s.pressure)}</b></div><div>Humidity<b>${s.humidity != null ? s.humidity + '%' : '–'}</b></div><div>Altitude<b>${fU('alt', s.altitude)}</b></div><div>Wind<b>${esc(s.wind || '–')}</b></div></div>
       ${s.notes ? `<div class="note">${esc(s.notes)}</div>` : ''}</div>
       <div class="btns"><button class="btn pri" data-act="newString" data-id="${s.id}">+ Record string / group</button><button class="btn" data-act="editSession" data-id="${s.id}">Edit session</button></div>
       <h2>Strings</h2>${s.strings.map(st => {
-        const v = stats(parseVels(st.vels)); const b = get('batches', st.batchId);
+        const v = stats(stringVels(st)); const b = get('batches', st.batchId);
         return `<div class="card" data-act="editString" data-id="${s.id}" data-sid="${st.id}" style="cursor:pointer"><div class="row"><div class="grow ttl">${esc(nLoad(get('loads', b && b.loadId)))}</div>${st.pressureSigns ? pill('bad', 'Pressure signs') : ''}</div>
-        <div class="kv"><div>Shots<b>${st.shots}</b></div><div>Avg<b>${fx(v.avg, 0)} ${st.velUnit === 'fps' ? 'fps' : v.n ? 'm/s' : ''}</b></div><div>ES<b>${fx(v.es, 0)}</b></div><div>SD<b>${fx(v.sd, 1)}</b></div><div>Group<b>${st.groupMm ? fx(st.groupMm, 0) + ' mm' : '–'}</b></div><div>MOA / mil<b>${st.groupMm ? fx(moa(st.groupMm, s.distance), 2) + ' / ' + fx(mil(st.groupMm, s.distance), 2) : '–'}</b></div></div>
+        <div class="kv"><div>Shots<b>${st.shots}</b></div><div>Avg<b>${fx(v.avg, 0)} ${v.n ? uLbl('vel') : ''}</b></div><div>ES<b>${fx(v.es, 0)}</b></div><div>SD<b>${fx(v.sd, 1)}</b></div><div>Group<b>${st.groupMm ? fU('group', st.groupMm) : '–'}</b></div><div>MOA / mil<b>${st.groupMm ? fx(moa(st.groupMm, s.distance), 2) + ' / ' + fx(mil(st.groupMm, s.distance), 2) : '–'}</b></div></div>
         ${st.poi ? `<div class="sub">POI: ${esc(st.poi)}</div>` : ''}${st.notes ? `<div class="note">${esc(st.notes)}</div>` : ''}</div>`;
       }).join('') || empty('No strings recorded yet.')}`;
   },
@@ -1214,7 +1250,7 @@ const views = {
       <h2>Equipment &amp; components</h2>
       ${it('#/rifles', 'Rifles', S.rifles.length)}${it('#/bullets', 'Bullets', S.bullets.length)}${it('#/powders', 'Powders', S.powders.length)}${it('#/primers', 'Primers', S.primers.length)}${it('#/brass', 'Brass lots', S.brass.length)}
       <h2>App</h2>
-      <div class="btns"><button class="btn" data-act="settings">Settings &amp; brass rules</button><button class="btn" data-act="ai">Photo reading (AI key)</button></div>
+      <div class="btns"><button class="btn" data-act="settings">Settings, units &amp; brass rules</button><button class="btn" data-act="ai">Photo reading (AI key)</button></div>
       <h2>Backup</h2>
       <div class="card sub">Your data is stored only on this device. Export a backup regularly (save it to OneDrive/Google Drive) — and use it to move data to another phone or PC.</div>
       <div class="btns"><button class="btn pri" data-act="export">Export backup</button><button class="btn" data-act="import">Import backup</button><button class="btn" data-act="csv">Export range data (CSV)</button></div>
@@ -1222,7 +1258,7 @@ const views = {
       <div class="disclaimer">Reload Log v${APP_VERSION}. This app records your own data — it does not supply load data. Always use published load manuals, start low, and work up watching for pressure signs.</div>`;
   },
   rifles() {
-    return `<div class="btns"><button class="btn pri" data-act="newRifle">+ New rifle</button></div>${S.rifles.map(r => `<div class="card" data-act="editRifle" data-id="${r.id}" style="cursor:pointer"><div class="ttl">${esc(r.name)}</div><div class="sub">${esc([r.calibre, r.twist && 'twist ' + r.twist, r.barrel, r.optic].filter(Boolean).join(' · '))}</div><div class="kv"><div>Round count<b>${rifleRounds(r)}</b></div><div>Loads<b>${S.loads.filter(l => l.rifleId === r.id).length}</b></div></div></div>`).join('') || empty('No rifles yet.')}`;
+    return `<div class="btns"><button class="btn pri" data-act="newRifle">+ New rifle</button></div>${S.rifles.map(r => `<div class="card" data-act="editRifle" data-id="${r.id}" style="cursor:pointer"><div class="ttl">${esc(r.name)}</div><div class="sub">${esc([r.calibre, r.twist && 'twist ' + r.twist, r.barrelLen != null ? fU('barrel', r.barrelLen) + ' barrel' : r.barrel, r.optic].filter(Boolean).join(' · '))}</div><div class="kv"><div>Round count<b>${rifleRounds(r)}</b></div><div>Loads<b>${S.loads.filter(l => l.rifleId === r.id).length}</b></div></div></div>`).join('') || empty('No rifles yet.')}`;
   },
   bullets() { return compListView('bullet', 'editBullet', 'newBullet', b => [b.diameter, b.bc, unitPrice(b) != null && money(unitPrice(b)) + ' each'], ''); },
   powders() { return compListView('powder', 'editPowder', 'newPowder', p => [unitPrice(p) != null && money(unitPrice(p) * 1000) + ' per kg'], ' g'); },
@@ -1238,7 +1274,7 @@ function batchCard(b) {
 }
 function sessionCard(s) {
   const shots = s.strings.reduce((a, st) => a + (+st.shots || 0), 0);
-  return card('#/session/' + s.id, `<div class="ttl">${esc(s.date)} · ${esc(nRifle(get('rifles', s.rifleId)))}</div><div class="sub">${esc(s.location || '')} ${esc(s.distance)}m · ${s.strings.length} string(s), ${shots} shots</div>`);
+  return card('#/session/' + s.id, `<div class="ttl">${esc(s.date)} · ${esc(nRifle(get('rifles', s.rifleId)))}</div><div class="sub">${esc(s.location || '')} ${fU('dist', s.distance)} · ${s.strings.length} string(s), ${shots} shots</div>`);
 }
 function brassCard(b) {
   const st = brassState(b);
@@ -1273,8 +1309,8 @@ function csvExport() {
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const rows = [['Date', 'Rifle', 'Location', 'Distance m', 'Temp C', 'Load', 'Bullet', 'Powder', 'Charge gr', 'CBTO mm', 'Brass lot', 'Batch date', 'Shots', 'Avg vel', 'ES', 'SD', 'Vel unit', 'Group mm', 'MOA', 'Velocities', 'Notes']];
   allStrings().sort((a, b) => byDate(a.session, b.session)).forEach(st => {
-    const s = st.session, b = get('batches', st.batchId) || {}, l = get('loads', b.loadId) || {}, v = stats(parseVels(st.vels));
-    rows.push([s.date, nRifle(get('rifles', s.rifleId)), s.location, s.distance, s.tempC, nLoad(l), nBullet(get('bullets', l.bulletId)), nPowder(get('powders', l.powderId)), l.charge, l.cbto, nBrass(get('brass', b.brassId)), b.date, st.shots, v.avg && v.avg.toFixed(1), v.es, v.sd && v.sd.toFixed(2), st.velUnit, st.groupMm, moa(st.groupMm, s.distance)?.toFixed(3), st.vels, st.notes]);
+    const s = st.session, b = get('batches', st.batchId) || {}, l = get('loads', b.loadId) || {}, v = stats(stringVels(st));
+    rows.push([s.date, nRifle(get('rifles', s.rifleId)), s.location, s.distance, s.tempC, nLoad(l), nBullet(get('bullets', l.bulletId)), nPowder(get('powders', l.powderId)), l.charge, l.cbto, nBrass(get('brass', b.brassId)), b.date, st.shots, v.avg && v.avg.toFixed(1), v.es, v.sd && v.sd.toFixed(2), uLbl("vel"), st.groupMm, moa(st.groupMm, s.distance)?.toFixed(3), st.vels, st.notes]);
   });
   download(`reload-log-range-${today()}.csv`, rows.map(r => r.map(q).join(',')).join('\n'), 'text/csv');
 }
@@ -1356,6 +1392,7 @@ window.addEventListener('hashchange', () => { closeModal(); render(); });
 
 (async () => {
   await load();
+  migrateUnits();
   numberBrass();
   sortAll();
   numberBatches();
