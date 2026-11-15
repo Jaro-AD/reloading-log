@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.9.0';
+const APP_VERSION = '1.10.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -340,7 +340,7 @@ function openForm(cfg) {
       case 'check': return `<label class="chk full" style="grid-column:1/-1"><input type="checkbox" name="${fd.k}"${val ? ' checked' : ''}> ${esc(fd.label)}</label>`;
       case 'len': inp = `<input name="${fd.k}" type="number" step="any" inputmode="decimal" value="${esc(toDisp(val ?? null))}" placeholder="${esc(fd.ph || '')}">`; break;
       case 'num': inp = `<input name="${fd.k}" type="number" step="any" inputmode="decimal" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`; break;
-      case 'date': inp = `<input name="${fd.k}" type="date" value="${esc(val || today())}">`; break;
+      case 'date': inp = `<input name="${fd.k}" type="date" value="${esc(val || (fd.noDefault ? '' : today()))}">`; break;
       case 'password': inp = `<input name="${fd.k}" type="password" autocomplete="off" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`; break;
       default: inp = `<input name="${fd.k}" type="text" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`;
         if (fd.photo) inp = `<div class="row" style="flex-wrap:nowrap">${inp}<button type="button" class="btn sm" style="white-space:nowrap;flex:none" data-act="lotPhoto" data-k="${fd.k}" title="Photograph the lot number">📷 Lot</button></div>`;
@@ -994,11 +994,69 @@ const statusPill = s => s === 'proven' ? pill('ok', 'Proven') : s === 'rejected'
 const empty = t => `<div class="empty">${t}</div>`;
 const card = (go, inner) => `<a class="card" href="${go}">${inner}</a>`;
 
+/* ---------- velocity tests (development) & approved velocity (proven) ---------- */
+const TEST_SLOTS = 5;
+const velU = () => S.settings.velUnit === 'fps' ? 'fps' : 'm/s';
+function seasonOf(date) { // Southern hemisphere
+  const m = +(String(date || '').slice(5, 7)); if (!m) return '';
+  return m === 12 || m <= 2 ? 'Summer' : m <= 5 ? 'Autumn' : m <= 8 ? 'Winter' : 'Spring';
+}
+const testsOf = l => Array.isArray(l.tests) ? l.tests : [];
+function testsAvg(l) { const v = testsOf(l).map(t => +t.vel).filter(x => x > 0); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; }
+function velTestsForm(l) {
+  const v = {}; testsOf(l).forEach((t, i) => Object.entries(t).forEach(([k, x]) => v[`t${i + 1}_${k}`] = x));
+  const fields = [];
+  for (let i = 1; i <= TEST_SLOTS; i++) fields.push(
+    { type: 'section', label: `Test ${i}` },
+    { k: `t${i}_date`, label: 'Date', type: 'date', noDefault: true },
+    { k: `t${i}_season`, label: 'Time of year', ph: 'auto from date' },
+    { k: `t${i}_vel`, label: `Speed (${velU()})`, type: 'num' },
+    { k: `t${i}_ammoTemp`, label: 'Ammo / powder temp (°C)', type: 'num' },
+    { k: `t${i}_airTemp`, label: 'Air temp (°C)', type: 'num' },
+    { k: `t${i}_humidity`, label: 'Humidity (%)', type: 'num' });
+  openForm({
+    title: 'Velocity tests — ' + nLoad(l), values: v, fields,
+    intro: `<div class="card sub">Up to ${TEST_SLOTS} tests while developing this load. Speed = average of that test's string. Time of year fills in from the date.</div>`,
+    hint: o => { const vs = []; for (let i = 1; i <= TEST_SLOTS; i++) if (o[`t${i}_vel`] > 0) vs.push(o[`t${i}_vel`]); if (!vs.length) return ''; const s = stats(vs); return `<div class="card kv"><div>Tests<b>${s.n}</b></div><div>Average<b>${fx(s.avg, 0)} ${velU()}</b></div><div>Spread<b>${fx(s.es, 0)}</b></div></div>`; },
+    onSave: o => {
+      const tests = [];
+      for (let i = 1; i <= TEST_SLOTS; i++) {
+        const t = {}; ['date', 'season', 'vel', 'ammoTemp', 'airTemp', 'humidity'].forEach(k => { const x = o[`t${i}_${k}`]; if (x != null && x !== '') t[k] = x; });
+        if (!Object.keys(t).length) continue;
+        if (!t.season && t.date) t.season = seasonOf(t.date);
+        tests.push(t);
+      }
+      l.tests = tests; l.velUnit = velU();
+    }
+  });
+}
+function approvedVelForm(l) {
+  const avg = testsAvg(l);
+  openForm({
+    title: 'Approved velocity — ' + nLoad(l),
+    values: { provenVel: l.provenVel ?? (avg != null ? Math.round(avg) : null), provenTemp: l.provenTemp, provenDate: l.provenDate },
+    intro: avg != null && l.provenVel == null ? `<div class="alert ok">Filled in from the average of your ${testsOf(l).length} development test(s) — change if needed.</div>` : '',
+    fields: [
+      { k: 'provenVel', label: `Average speed (${velU()})`, type: 'num', req: true },
+      { k: 'provenTemp', label: 'Measured at temperature (°C)', type: 'num', req: true },
+      { k: 'provenDate', label: 'Date measured', type: 'date', noDefault: true }
+    ],
+    onSave: o => { Object.assign(l, o); l.velUnit = velU(); }
+  });
+}
+function velSection(l) {
+  const u = l.velUnit || velU(), tests = testsOf(l);
+  const approved = `<h2>Approved velocity</h2>${l.provenVel != null
+    ? `<div class="card kv" style="margin-top:0" data-act="approvedVel" data-id="${l.id}"><div>Average speed<b>${fx(l.provenVel, 0)} ${u}</b></div><div>At temperature<b>${l.provenTemp != null ? l.provenTemp + ' °C' : '–'}</b></div><div>Date<b>${esc(l.provenDate || '–')}</b></div></div>`
+    : empty('Not recorded yet.')}<div class="btns"><button class="btn${l.status === 'proven' ? ' pri' : ''}" data-act="approvedVel" data-id="${l.id}">${l.provenVel != null ? 'Edit' : 'Record'} approved velocity</button></div>`;
+  const devTable = `<h2>Velocity tests (${tests.length}/${TEST_SLOTS})</h2>${tests.length ? `<div class="tblwrap"><table><tr><th>#</th><th>Date</th><th>Season</th><th>Speed</th><th>Ammo °C</th><th>Air °C</th><th>Hum %</th></tr>${tests.map((t, i) => `<tr><td>${i + 1}</td><td>${esc(t.date || '')}</td><td>${esc(t.season || '')}</td><td>${fx(t.vel, 0)}</td><td>${t.ammoTemp ?? ''}</td><td>${t.airTemp ?? ''}</td><td>${t.humidity ?? ''}</td></tr>`).join('')}<tr><td></td><td colspan="2"><b>Average</b></td><td><b>${fx(testsAvg(l), 0)}</b></td><td colspan="3">${u}</td></tr></table></div>` : empty('No tests recorded yet.')}<div class="btns"><button class="btn${l.status !== 'proven' ? ' pri' : ''}" data-act="velTests" data-id="${l.id}">${tests.length ? 'Edit' : 'Enter'} velocity tests</button></div>`;
+  return l.status === 'proven' ? approved + (tests.length ? devTable : '') : devTable + (l.provenVel != null ? approved : '');
+}
 function loadCard(l) {
   const s = loadSummary(l.id);
   return card('#/load/' + l.id, `<div class="row"><div class="grow ttl">${esc(nLoad(l))}</div>${statusPill(l.status)}</div>
     <div class="sub">${esc(nRifle(get('rifles', l.rifleId)))} · ${esc(nBullet(get('bullets', l.bulletId)))}</div>
-    <div class="kv"><div>Charge<b>${fx(l.charge, 2)} gr</b></div><div>CBTO<b>${fLen(l.cbto)}</b></div><div>Avg vel / SD<b>${s.n ? fx(s.avg, 0) + ' / ' + fx(s.sd, 1) : '–'}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Cost / round<b>${money(roundCost(l)?.total)}</b></div></div>`);
+    <div class="kv"><div>Charge<b>${fx(l.charge, 2)} gr</b></div><div>CBTO<b>${fLen(l.cbto)}</b></div><div>${l.provenVel != null ? 'Approved speed' : 'Avg vel / SD'}<b>${l.provenVel != null ? fx(l.provenVel, 0) + ' ' + (l.velUnit || velU()) + (l.provenTemp != null ? ' @ ' + l.provenTemp + '°C' : '') : s.n ? fx(s.avg, 0) + ' / ' + fx(s.sd, 1) : testsAvg(l) != null ? fx(testsAvg(l), 0) + ' (tests)' : '–'}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Cost / round<b>${money(roundCost(l)?.total)}</b></div></div>`);
 }
 
 const views = {
@@ -1052,6 +1110,7 @@ const views = {
       ${l.maxCharge == null ? '<div class="alert">No manual max recorded for this load.</div>' : ''}
       <div class="btns"><button class="btn pri" data-act="newBatch" data-load="${l.id}">+ Load a batch</button><button class="btn" data-act="editLoad" data-id="${l.id}">Edit</button><button class="btn" data-act="copyLoad" data-id="${l.id}">Copy &amp; tweak</button></div>
       ${l.series ? `<a class="card" href="#/series/${encodeURIComponent(l.series)}"><span class="sub">Part of test series</span> <b>${esc(l.series)}</b> ›</a>` : ''}
+      ${velSection(l)}
       <h2>Cost per round (current prices)</h2>${costBreakdown(roundCost(l))}
       <h2>Performance</h2>
       <div class="card kv" style="margin-top:0"><div>Shots<b>${s.shots}</b></div><div>Avg vel<b>${fx(s.avg, 0)}</b></div><div>ES (all)<b>${fx(s.es, 0)}</b></div><div>SD (all)<b>${fx(s.sd, 1)}</b></div><div>Best group<b>${s.bestMoa ? fx(s.bestMoa, 2) + ' MOA' : '–'}</b></div><div>Avg group<b>${s.avgMoa ? fx(s.avgMoa, 2) + ' MOA' : '–'}</b></div></div>
@@ -1250,6 +1309,8 @@ function render() {
 const ACTIONS = {
   newBatch: d => batchForm(null, { loadId: d.load || undefined, brassId: d.brass || undefined, rifleId: d.rifle || undefined }),
   editBatch: d => batchForm(get('batches', d.id)),
+  velTests: d => velTestsForm(get('loads', d.id)),
+  approvedVel: d => approvedVelForm(get('loads', d.id)),
   newLoad: () => loadForm(), editLoad: d => loadForm(get('loads', d.id)), copyLoad: d => loadForm(null, get('loads', d.id)),
   ladder: () => ladderForm(),
   newSession: () => sessionForm(), editSession: d => sessionForm(get('sessions', d.id)),
