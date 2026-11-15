@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -54,6 +54,15 @@ function normalise(d) {
   if (!out.products || typeof out.products !== 'object' || Array.isArray(out.products)) out.products = {};
   return out;
 }
+function batchNo(b) {
+  const l = get('loads', b.loadId), r = l && get('rifles', l.rifleId);
+  const cal = ((r && r.calibre) || 'B').replace(/[^0-9a-z]/gi, '').slice(0, 6).toUpperCase() || 'B';
+  const d = (b.date || today()).replace(/-/g, '').slice(2);
+  const pre = `${cal}-${d}-`;
+  const used = S.batches.filter(x => x !== b && x.no && x.no.startsWith(pre)).length;
+  return pre + String(used + 1).padStart(2, '0');
+}
+function numberBatches() { [...S.batches].sort(byDate).forEach(b => { if (!b.no) b.no = batchNo(b); }); }
 async function save() {
   const el = $('#savestate');
   try {
@@ -439,13 +448,14 @@ function brassHint(brassId) {
 function batchForm(b, preset) {
   if (!S.loads.length) { alert('Create a load recipe first.'); location.hash = '#/loads'; return; }
   const v = b || { date: today(), sizing: 'neck', ...(preset || {}) };
+  const rf = !b && preset && preset.rifleId ? get('rifles', preset.rifleId) : null;
   if (!b && v.loadId && !v.brassId) { const l = get('loads', v.loadId); if (l && l.brassId) v.brassId = l.brassId; }
   openForm({
-    title: b ? 'Edit batch' : 'Load a batch', values: v, hintTop: true,
+    title: b ? 'Edit batch ' + (b.no || '') : 'Load a batch' + (rf ? ' — ' + rf.name : ''), values: v, hintTop: true,
     fields: [
       { k: 'date', label: 'Date loaded', type: 'date' },
       { k: 'qty', label: 'Rounds loaded', type: 'num', req: true },
-      { k: 'loadId', label: 'Load recipe', type: 'select', req: true, options: opts('loads', nLoad, l => l.status !== 'rejected' || (b && b.loadId === l.id)), full: true },
+      { k: 'loadId', label: 'Load recipe', type: 'select', req: true, options: opts('loads', nLoad, l => (l.status !== 'rejected' && (!rf || l.rifleId === rf.id)) || (b && b.loadId === l.id)).sort((x, y) => (get('loads', y[0]).status === 'proven') - (get('loads', x[0]).status === 'proven')), full: true },
       { k: 'brassId', label: 'Brass lot', type: 'select', req: true, options: opts('brass', nBrass, x => !x.retired || (b && b.brassId === x.id)), full: true },
       { type: 'section', label: 'Case prep done for this batch' },
       { k: 'sizing', label: 'Sizing', type: 'select', options: SIZING, noBlank: true, full: true },
@@ -486,6 +496,7 @@ function batchForm(b, preset) {
       if (b && o.qty < batchFired(b.id)) return `Already ${batchFired(b.id)} fired from this batch.`;
       const reprice = !b || !b.cost || b.cost.missing.length || b.loadId !== o.loadId || b.brassId !== o.brassId;
       const n = upsert('batches', b, o);
+      if (!n.no) n.no = batchNo(n);
       if (reprice) { const c = roundCost(get('loads', n.loadId), n.brassId); if (c && c.total != null) n.cost = c; }
       return b ? null : { go: '#/batch/' + n.id };
     },
@@ -910,15 +921,32 @@ const views = {
   batches() {
     const list = [...S.batches].sort(byDate).reverse();
     const ready = list.filter(b => batchLeft(b) > 0), done = list.filter(b => batchLeft(b) <= 0);
-    return `<div class="btns"><button class="btn pri" data-act="newBatch">+ Load a batch</button></div>
+    return `<div class="btns"><button class="btn pri" data-act="newBatch">+ Load a batch</button><a class="btn" href="#/sheet" style="text-decoration:none;text-align:center">📋 Loading log sheet</a></div>
       <h2>Loaded (${ready.reduce((a, b) => a + batchLeft(b), 0)} rounds)</h2>${ready.map(batchCard).join('') || empty('No loaded rounds.')}
       <h2>Fired</h2>${done.map(batchCard).join('') || empty('None yet.')}`;
+  },
+  sheet(q) {
+    const rf = q.sheetRifle || '';
+    const rows = S.batches.map(b => ({ b, l: get('loads', b.loadId) || {} })).filter(x => !rf || x.l.rifleId === rf).sort((x, y) => byDate(y.b, x.b));
+    const sum = keyFn => {
+      const m = new Map();
+      rows.forEach(({ b, l }) => { const k = keyFn(b, l); const e = m.get(k) || { loaded: 0, fired: 0, batches: 0, last: '' }; e.loaded += +b.qty || 0; e.fired += batchFired(b.id); e.batches++; if ((b.date || '') > e.last) e.last = b.date; m.set(k, e); });
+      return [...m.entries()].sort((a, b) => b[1].loaded - a[1].loaded);
+    };
+    const tot = (title, list) => `<h2>${title}</h2>${list.length ? `<div class="tblwrap"><table><tr><th></th><th>Loaded</th><th>Fired</th><th>Left</th><th>Batches</th><th>Last</th></tr>${list.map(([k, e]) => `<tr><td style="white-space:normal">${esc(k)}</td><td>${e.loaded}</td><td>${e.fired}</td><td><b>${e.loaded - e.fired}</b></td><td>${e.batches}</td><td>${esc(e.last)}</td></tr>`).join('')}</table></div>` : empty('Nothing loaded yet.')}`;
+    const all = rows.reduce((a, { b }) => a + (+b.qty || 0), 0), left = rows.reduce((a, { b }) => a + Math.max(0, batchLeft(b)), 0);
+    return `<select class="filter" data-filter="sheetRifle"><option value="">All rifles</option>${S.rifles.map(r => `<option value="${r.id}"${r.id === rf ? ' selected' : ''}>${esc(nRifle(r))}</option>`).join('')}</select>
+      <div class="btns"><button class="btn pri" data-act="newBatch" data-rifle="${esc(rf)}">+ Load a batch${rf ? ' for this rifle' : ''}</button><button class="btn" data-act="sheetCsv">Export CSV</button></div>
+      <div class="card kv" style="margin-top:0"><div>Total loaded<b>${all}</b></div><div>Fired<b>${all - left}</b></div><div>Loaded &amp; ready<b>${left}</b></div><div>Batches<b>${rows.length}</b></div></div>
+      ${tot('Totals by load', sum((b, l) => nLoad(l) + (rf ? '' : ' · ' + ((get('rifles', l.rifleId) || {}).name || ''))))}
+      ${tot('Totals by bullet', sum((b, l) => nBullet(get('bullets', l.bulletId))))}
+      <h2>Loading log</h2>${rows.length ? `<div class="tblwrap"><table><tr><th>Date</th><th>Batch</th>${rf ? '' : '<th>Rifle</th>'}<th>Load</th><th>Bullet</th><th>Charge</th><th>Qty</th><th>Left</th><th>Brass</th></tr>${rows.map(({ b, l }) => `<tr data-go="#/batch/${b.id}"><td>${esc(b.date)}</td><td>${esc(b.no || '')}</td>${rf ? '' : `<td>${esc((get('rifles', l.rifleId) || {}).name || '')}</td>`}<td>${esc(nLoad(l))}</td><td>${esc(nBullet(get('bullets', l.bulletId)))}</td><td>${fx(l.charge, 1)}gr</td><td>${b.qty}</td><td>${batchLeft(b)}</td><td>${esc((get('brass', b.brassId) || {}).name || '')}</td></tr>`).join('')}</table></div>` : empty('No batches loaded yet.')}`;
   },
   batch(q, id) {
     const b = get('batches', id); if (!b) return empty('Batch not found.');
     const l = get('loads', b.loadId);
     const strs = allStrings().filter(s => s.batchId === b.id);
-    return `<div class="card"><div class="ttl">${esc(nLoad(l))}</div><div class="sub">Loaded ${esc(b.date)}</div>
+    return `<div class="card"><div class="ttl">${esc(nLoad(l))}</div><div class="sub">Batch <b>${esc(b.no || '–')}</b> · loaded ${esc(b.date)}</div>
       <div class="kv"><div>Loaded<b>${b.qty}</b></div><div>Fired<b>${batchFired(b.id)}</b></div><div>Left<b>${batchLeft(b)}</b></div>
       <div>Brass lot<b>${esc(nBrass(get('brass', b.brassId)))}</b></div><div>Sizing<b>${esc((SIZING.find(s => s[0] === b.sizing) || [, '–'])[1])}</b></div>
       <div>Annealed<b>${b.annealed ? 'Yes' : 'No'}</b></div><div>Trimmed<b>${b.trimmed ? 'Yes' : 'No'}</b></div><div>Case length<b>${fLen(b.measuredLen)}</b></div><div>Bump<b>${esc(b.bump || '–')}</b></div></div>
@@ -994,7 +1022,7 @@ function stockCard(act, id, title, sub, left, total, unit) {
 }
 function batchCard(b) {
   const left = batchLeft(b);
-  return card('#/batch/' + b.id, `<div class="row"><div class="grow"><div class="ttl">${esc(nLoad(get('loads', b.loadId)))}</div><div class="sub">${esc(b.date)} · ${esc(nBrass(get('brass', b.brassId)))}${b.annealed ? ' · annealed' : ''}${(c => c && c.total != null ? ' · ' + money(c.total) + '/rd' : '')(batchCost(b))}</div></div><div style="text-align:right"><div class="ttl">${left}/${b.qty}</div><div class="sub">left</div></div></div>`);
+  return card('#/batch/' + b.id, `<div class="row"><div class="grow"><div class="ttl">${esc(nLoad(get('loads', b.loadId)))}</div><div class="sub">${b.no ? esc(b.no) + ' · ' : ''}${esc(b.date)} · ${esc(nBrass(get('brass', b.brassId)))}${b.annealed ? ' · annealed' : ''}${(c => c && c.total != null ? ' · ' + money(c.total) + '/rd' : '')(batchCost(b))}</div></div><div style="text-align:right"><div class="ttl">${left}/${b.qty}</div><div class="sub">left</div></div></div>`);
 }
 function sessionCard(s) {
   const shots = s.strings.reduce((a, st) => a + (+st.shots || 0), 0);
@@ -1048,8 +1076,8 @@ async function importFile(file) {
 }
 
 /* ---------- routing & events ---------- */
-const TITLES = { home: 'Reload Log', loads: 'Load recipes', load: 'Load', series: 'Test series', batches: 'Batches', batch: 'Batch', range: 'Range sessions', session: 'Range session', brass: 'Brass lots', brasslot: 'Brass lot', setup: 'Setup', rifles: 'Rifles', bullets: 'Bullets', powders: 'Powders', primers: 'Primers' };
-const TAB_OF = { load: 'loads', series: 'loads', batch: 'batches', session: 'range', brasslot: 'brass', rifles: 'setup', bullets: 'setup', powders: 'setup', primers: 'setup' };
+const TITLES = { sheet: 'Loading log sheet', home: 'Reload Log', loads: 'Load recipes', load: 'Load', series: 'Test series', batches: 'Batches', batch: 'Batch', range: 'Range sessions', session: 'Range session', brass: 'Brass lots', brasslot: 'Brass lot', setup: 'Setup', rifles: 'Rifles', bullets: 'Bullets', powders: 'Powders', primers: 'Primers' };
+const TAB_OF = { sheet: 'batches', load: 'loads', series: 'loads', batch: 'batches', session: 'range', brasslot: 'brass', rifles: 'setup', bullets: 'setup', powders: 'setup', primers: 'setup' };
 const query = {};
 function route() {
   const [path] = (location.hash || '#/home').slice(2).split('?');
@@ -1067,7 +1095,7 @@ function render() {
   window.scrollTo(0, y); render._last = location.hash;
 }
 const ACTIONS = {
-  newBatch: d => batchForm(null, { loadId: d.load || undefined, brassId: d.brass || undefined }),
+  newBatch: d => batchForm(null, { loadId: d.load || undefined, brassId: d.brass || undefined, rifleId: d.rifle || undefined }),
   editBatch: d => batchForm(get('batches', d.id)),
   newLoad: () => loadForm(), editLoad: d => loadForm(get('loads', d.id)), copyLoad: d => loadForm(null, get('loads', d.id)),
   ladder: () => ladderForm(),
@@ -1086,7 +1114,13 @@ const ACTIONS = {
   ai: () => aiForm(),
   export: () => download(`reload-log-backup-${today()}.json`, JSON.stringify({ ...S, exported: new Date().toISOString(), app: APP_VERSION }, null, 1), 'application/json'),
   import: () => $('#importfile').click(),
-  csv: () => csvExport()
+  csv: () => csvExport(),
+  sheetCsv: () => {
+    const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = [['Date', 'Batch', 'Rifle', 'Load', 'Bullet', 'Powder', 'Charge gr', 'Primer', 'Brass lot', 'Qty loaded', 'Fired', 'Left', 'Sizing', 'Annealed', 'Notes']];
+    [...S.batches].sort(byDate).forEach(b => { const l = get('loads', b.loadId) || {}; rows.push([b.date, b.no, (get('rifles', l.rifleId) || {}).name, nLoad(l), nBullet(get('bullets', l.bulletId)), nPowder(get('powders', l.powderId)), l.charge, nPrimer(get('primers', l.primerId)), (get('brass', b.brassId) || {}).name, b.qty, batchFired(b.id), batchLeft(b), b.sizing, b.annealed ? 'yes' : '', b.notes]); });
+    download(`reload-log-loading-${today()}.csv`, rows.map(r => r.map(q).join(',')).join('\n'), 'text/csv');
+  }
 };
 document.addEventListener('click', e => {
   if (e.target.closest('[data-close]') || e.target.id === 'modal') return closeModal();
@@ -1103,6 +1137,7 @@ window.addEventListener('hashchange', () => { closeModal(); render(); });
 
 (async () => {
   await load();
+  numberBatches();
   render();
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
