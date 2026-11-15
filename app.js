@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.6.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -18,6 +18,30 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const today = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
 const byDate = (a, b) => (a.date || '').localeCompare(b.date || '') || (a.created || 0) - (b.created || 0);
 const get = (col, id) => S[col].find(x => x.id === id);
+/* Natural order: alphabetical, numbers small → large (e.g. 140gr before 168gr). */
+const nat = (a, b) => String(a ?? '').localeCompare(String(b ?? ''), undefined, { numeric: true, sensitivity: 'base' });
+/* Calibre size in mm, so .223 < 6.5 CM < 7mm < .308 < 9.3x62 */
+function calKey(c) {
+  const t = String(c || '').trim(); if (!t) return 999;
+  let m = t.match(/^\.(\d+)/); if (m) return parseFloat('0.' + m[1]) * 25.4;
+  m = t.match(/(\d+(?:[.,]\d+)?)/); if (!m) return 998;
+  const v = parseFloat(m[1].replace(',', '.'));
+  if (/[.,]/.test(m[1]) || v < 17) return v;
+  return v < 100 ? v / 100 * 25.4 : v < 1000 ? v / 1000 * 25.4 : v;
+}
+const by = (...fns) => (a, b) => { for (const f of fns) { const r = f(a, b); if (r) return r; } return 0; };
+const num0 = v => (v == null || v === '' || isNaN(+v)) ? Infinity : +v;
+const PRIMER_ORDER = ['Small Pistol', 'Small Rifle', 'Small Rifle Magnum', 'Large Pistol', 'Large Rifle', 'Large Rifle Magnum', 'Other'];
+const SORTS = {
+  rifles: by((a, b) => calKey(a.calibre) - calKey(b.calibre), (a, b) => nat(a.calibre, b.calibre), (a, b) => nat(a.name, b.name)),
+  bullets: by((a, b) => calKey(a.diameter) - calKey(b.diameter), (a, b) => num0(a.weight) - num0(b.weight), (a, b) => nat(a.maker, b.maker), (a, b) => nat(a.name, b.name), (a, b) => nat(a.lot, b.lot)),
+  powders: by((a, b) => nat(a.maker, b.maker), (a, b) => nat(a.name, b.name), (a, b) => nat(a.lot, b.lot)),
+  primers: by((a, b) => (PRIMER_ORDER.indexOf(a.size) + 1 || 99) - (PRIMER_ORDER.indexOf(b.size) + 1 || 99), (a, b) => nat(a.maker, b.maker), (a, b) => nat(a.name, b.name), (a, b) => nat(a.lot, b.lot)),
+  brass: by((a, b) => calKey(a.calibre) - calKey(b.calibre), (a, b) => nat(a.name, b.name)),
+  loads: by((a, b) => nat(nLoad(a), nLoad(b)), (a, b) => num0(a.charge) - num0(b.charge)),
+  batches: byDate, sessions: byDate
+};
+function sortAll() { Object.entries(SORTS).forEach(([c, f]) => { if (Array.isArray(S[c])) S[c].sort(f); }); }
 const opts = (col, namer, filter) => S[col].filter(filter || (() => true)).map(x => [x.id, namer(x)]);
 
 /* ---------- storage ---------- */
@@ -64,6 +88,7 @@ function batchNo(b) {
 }
 function numberBatches() { [...S.batches].sort(byDate).forEach(b => { if (!b.no) b.no = batchNo(b); }); }
 async function save() {
+  sortAll();
   const el = $('#savestate');
   try {
     const db = await idb();
@@ -455,7 +480,7 @@ function batchForm(b, preset) {
     fields: [
       { k: 'date', label: 'Date loaded', type: 'date' },
       { k: 'qty', label: 'Rounds loaded', type: 'num', req: true },
-      { k: 'loadId', label: 'Load recipe', type: 'select', req: true, options: opts('loads', nLoad, l => (l.status !== 'rejected' && (!rf || l.rifleId === rf.id)) || (b && b.loadId === l.id)).sort((x, y) => (get('loads', y[0]).status === 'proven') - (get('loads', x[0]).status === 'proven')), full: true },
+      { k: 'loadId', label: 'Load recipe', type: 'select', req: true, options: opts('loads', nLoad, l => (l.status !== 'rejected' && (!rf || l.rifleId === rf.id)) || (b && b.loadId === l.id)), full: true },
       { k: 'brassId', label: 'Brass lot', type: 'select', req: true, options: opts('brass', nBrass, x => !x.retired || (b && b.brassId === x.id)), full: true },
       { type: 'section', label: 'Case prep done for this batch' },
       { k: 'sizing', label: 'Sizing', type: 'select', options: SIZING, noBlank: true, full: true },
@@ -871,8 +896,8 @@ const views = {
   loads(q) {
     const rf = q.rifle || '';
     const list = S.loads.filter(l => !rf || l.rifleId === rf);
-    const series = [...new Set(list.map(l => l.series).filter(Boolean))];
-    const grp = k => list.filter(l => (l.status || 'dev') === k).sort((a, b) => nLoad(a).localeCompare(nLoad(b)));
+    const series = [...new Set(list.map(l => l.series).filter(Boolean))].sort(nat);
+    const grp = k => list.filter(l => (l.status || 'dev') === k).sort(SORTS.loads);
     return `<div class="btns"><button class="btn pri" data-act="newLoad">+ New load</button><button class="btn" data-act="ladder">Ladder planner</button></div>
       ${S.rifles.length > 1 ? `<select class="filter" data-filter="rifle"><option value="">All rifles</option>${S.rifles.map(r => `<option value="${r.id}"${r.id === rf ? ' selected' : ''}>${esc(nRifle(r))}</option>`).join('')}</select>` : ''}
       ${series.length ? `<h2>Test series</h2>${series.map(t => card('#/series/' + encodeURIComponent(t), `<div class="row"><div class="grow ttl">${esc(t)}</div><span class="sub">${list.filter(l => l.series === t).length} loads ›</span></div>`)).join('')}` : ''}
@@ -931,7 +956,7 @@ const views = {
     const sum = keyFn => {
       const m = new Map();
       rows.forEach(({ b, l }) => { const k = keyFn(b, l); const e = m.get(k) || { loaded: 0, fired: 0, batches: 0, last: '' }; e.loaded += +b.qty || 0; e.fired += batchFired(b.id); e.batches++; if ((b.date || '') > e.last) e.last = b.date; m.set(k, e); });
-      return [...m.entries()].sort((a, b) => b[1].loaded - a[1].loaded);
+      return [...m.entries()].sort((a, b) => nat(a[0], b[0]));
     };
     const tot = (title, list) => `<h2>${title}</h2>${list.length ? `<div class="tblwrap"><table><tr><th></th><th>Loaded</th><th>Fired</th><th>Left</th><th>Batches</th><th>Last</th></tr>${list.map(([k, e]) => `<tr><td style="white-space:normal">${esc(k)}</td><td>${e.loaded}</td><td>${e.fired}</td><td><b>${e.loaded - e.fired}</b></td><td>${e.batches}</td><td>${esc(e.last)}</td></tr>`).join('')}</table></div>` : empty('Nothing loaded yet.')}`;
     const all = rows.reduce((a, { b }) => a + (+b.qty || 0), 0), left = rows.reduce((a, { b }) => a + Math.max(0, batchLeft(b)), 0);
@@ -974,9 +999,9 @@ const views = {
   },
   brass() {
     const act = S.brass.filter(b => !b.retired), ret = S.brass.filter(b => b.retired);
-    const cals = [...new Set(act.map(b => (b.calibre || 'Other').trim()))].sort();
+    const cals = [...new Set(act.map(b => (b.calibre || 'Other').trim()))].sort((a, b) => calKey(a) - calKey(b) || nat(a, b));
     return `<div class="btns"><button class="btn pri" data-act="newBrass">+ New brass lot</button><button class="btn" data-act="scan" data-kind="brass">▦ Scan</button><button class="btn" data-act="photo" data-kind="brass">📷 Photo</button></div>
-      ${cals.map(c => { const lots = act.filter(b => (b.calibre || 'Other').trim() === c).sort((a, b) => a.name.localeCompare(b.name)); return `<h2>${esc(c)} — ${lots.length} lot(s), ${lots.reduce((a, b) => a + (+b.count || 0), 0)} cases</h2>${lots.map(brassCard).join('')}`; }).join('') || empty('No brass lots yet.')}
+      ${cals.map(c => { const lots = act.filter(b => (b.calibre || 'Other').trim() === c).sort(SORTS.brass); return `<h2>${esc(c)} — ${lots.length} lot(s), ${lots.reduce((a, b) => a + (+b.count || 0), 0)} cases</h2>${lots.map(brassCard).join('')}`; }).join('') || empty('No brass lots yet.')}
       ${ret.length ? `<h2>Retired</h2>${ret.map(brassCard).join('')}` : ''}`;
   },
   brasslot(q, id) {
@@ -1137,6 +1162,7 @@ window.addEventListener('hashchange', () => { closeModal(); render(); });
 
 (async () => {
   await load();
+  sortAll();
   numberBatches();
   render();
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
