@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.8.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -372,7 +372,7 @@ function openForm(cfg) {
     const r = await cfg.onSave(o);
     if (typeof r === 'string') return err(r);
     closeModal(); await save();
-    if (typeof r === 'object' && r && r.go) location.hash = r.go; else render();
+    if (typeof r === 'object' && r && r.go && location.hash !== r.go) location.hash = r.go; else render();
     if (typeof r === 'object' && r && r.next) r.next();
   };
   if (cfg.onDelete) $('#fdel').onclick = async () => {
@@ -484,6 +484,7 @@ function brassForm(br, preset) {
       { k: 'makerLot', label: "Maker's lot number", photo: true, full: true },
       { k: 'calibre', label: 'Calibre', ph: '.308 Win' },
       { k: 'count', label: 'Number of cases', type: 'num' },
+      ...(br ? [] : [{ k: 'splitSize', label: 'Split into lots of', type: 'num', full: true, ph: 'e.g. 50', help: 'Optional. A box of 100 split into lots of 50 makes "<name> – 1" and "<name> – 2", each tracked separately.' }]),
       { k: 'rifleId', label: 'Fire-formed to rifle', type: 'select', options: opts('rifles', nRifle) },
       { type: 'section', label: 'History when added (0 for new brass)' },
       { k: 'initFirings', label: 'Times fired', type: 'num', def: 0 },
@@ -501,7 +502,15 @@ function brassForm(br, preset) {
       ...scanFields('Cases per box, e.g. 100'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { const n = upsert('brass', br, o); learn('brass', o); return br ? null : { go: '#/brasslot/' + n.id }; },
+    onSave: o => {
+      const split = o.splitSize; delete o.splitSize;
+      if (!br && split > 0 && o.count > split) {
+        const parts = Math.ceil(o.count / split);
+        for (let i = 1; i <= parts; i++) upsert('brass', null, { ...o, name: `${o.name} – ${i}`, count: Math.min(split, o.count - split * (i - 1)), mark: o.mark ? `${o.mark} · lot ${i}` : `Lot ${i}` });
+        learn('brass', o); return { go: '#/brass' };
+      }
+      const n = upsert('brass', br, o); learn('brass', o); return br ? null : { go: '#/brasslot/' + n.id };
+    },
     onDelete: br && (() => inUse('batches used this brass', S.batches.filter(b => b.brassId === br.id).length) || remove('brass', br.id)),
     afterDelete: '#/brass'
   });
