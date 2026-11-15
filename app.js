@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -42,6 +42,18 @@ const SORTS = {
   batches: byDate, sessions: byDate
 };
 function sortAll() { Object.entries(SORTS).forEach(([c, f]) => { if (Array.isArray(S[c])) S[c].sort(f); }); }
+/* One option per product (recipes are per product; the lot is taken from the open lot when you load a batch). */
+function prodOpts(kind, current) {
+  const seen = new Set(), out = [];
+  S[KIND_COL[kind]].forEach(x => {
+    const k = pkey(kind, x); if (seen.has(k)) return;
+    const grp = sameProduct(kind, x); if (grp.every(isFinished) && !grp.some(g => g.id === current)) return;
+    seen.add(k);
+    const r = grp.find(g => g.id === current) || activeLot(kind, x.id) || x;
+    out.push([r.id, kind === 'powder' ? `${r.maker || ''} ${r.name || ''}`.trim() : kind === 'bullet' ? nBullet(r) : nPrimer(r)]);
+  });
+  return out;
+}
 const opts = (col, namer, filter) => S[col].filter(filter || (() => true)).map(x => [x.id, namer(x)]);
 
 /* ---------- storage ---------- */
@@ -139,15 +151,15 @@ function stockUsed(kind, id) {
   S.batches.forEach(b => {
     const l = get('loads', b.loadId); if (!l) return;
     const q = +b.qty || 0;
-    if (kind === 'bullet' && l.bulletId === id) used += q;
-    if (kind === 'primer' && l.primerId === id) used += q;
-    if (kind === 'powder' && l.powderId === id) used += q * (+l.charge || 0) * GR_TO_G;
+    if (kind === 'bullet' && (b.bulletLot || l.bulletId) === id) used += q;
+    if (kind === 'primer' && (b.primerLot || l.primerId) === id) used += q;
+    if (kind === 'powder' && (b.powderLot || l.powderId) === id) used += q * (+l.charge || 0) * GR_TO_G;
   });
   return used;
 }
-const bulletLeft = b => (+b.qtyBought || 0) - stockUsed('bullet', b.id);
-const primerLeft = p => (+p.qtyBought || 0) - stockUsed('primer', p.id);
-const powderLeft = p => (+p.grams || 0) - stockUsed('powder', p.id);
+const bulletLeft = b => (+b.qtyBought || 0) - stockUsed('bullet', b.id) - (+b.writeOff || 0);
+const primerLeft = p => (+p.qtyBought || 0) - stockUsed('primer', p.id) - (+p.writeOff || 0);
+const powderLeft = p => (+p.grams || 0) - stockUsed('powder', p.id) - (+p.writeOff || 0);
 
 /* ---------- cost ---------- */
 const cur = () => S.settings.currency || 'R';
@@ -156,21 +168,21 @@ const money = (v, d = 2) => v == null || isNaN(v) ? '–' : cur() + ' ' + (+v).t
 const unitPrice = x => x && +x.price > 0 && +x.priceQty > 0 ? +x.price / +x.priceQty : null;
 // Brass is reused, so its cost is spread over the lot's life (retire-at firings, else the Settings default).
 const brassLife = br => rule(br, 'retireAt') || +S.settings.brassLife || 1;
-function roundCost(l, brassId) {
+function roundCost(l, brassId, b) {
   if (!l) return null;
   const br = get('brass', brassId || l.brassId);
-  const pw = unitPrice(get('powders', l.powderId)), bc = unitPrice(br);
+  const pw = unitPrice(lotOf('powder', b, l)), bc = unitPrice(br);
   const parts = {
-    bullet: unitPrice(get('bullets', l.bulletId)),
+    bullet: unitPrice(lotOf('bullet', b, l)),
     powder: pw != null ? pw * (+l.charge || 0) * GR_TO_G : null,
-    primer: unitPrice(get('primers', l.primerId)),
+    primer: unitPrice(lotOf('primer', b, l)),
     brass: bc != null ? bc / brassLife(br) : null
   };
   const have = Object.values(parts).filter(v => v != null);
   return { ...parts, total: have.length ? have.reduce((a, b) => a + b, 0) : null, missing: Object.keys(parts).filter(k => parts[k] == null) };
 }
 // Batches keep the cost from the day they were loaded, so later price changes don't rewrite history.
-const batchCost = b => b.cost || roundCost(get('loads', b.loadId), b.brassId);
+const batchCost = b => b.cost || roundCost(get('loads', b.loadId), b.brassId, b);
 const costNote = c => c && c.missing.length ? ` <span class="sub">(no price: ${c.missing.join(', ')})</span>` : '';
 function costBreakdown(c, extra = '') {
   if (!c || c.total == null) return '<div class="alert">No component prices yet — add them under Setup (bullets, powder, primers, brass) to see cost per round.</div>';
@@ -181,6 +193,83 @@ const priceFields = (forWhat, def) => [
   { k: 'price', label: `Price paid (${cur()})`, type: 'num', ph: 'e.g. 850' },
   { k: 'priceQty', label: `For how many ${forWhat}`, type: 'num', def, help: `e.g. price of ${def} ${forWhat}` }
 ];
+
+/* ---------- lots: open / in stock / finished, containers, combining ---------- */
+const KIND_COL = { bullet: 'bullets', powder: 'powders', primer: 'primers' };
+const QTY_KEY = { bullet: 'qtyBought', powder: 'grams', primer: 'qtyBought' };
+const PACK_WORD = { bullet: ['box', 'boxes'], powder: ['tub', 'tubs'], primer: ['box', 'boxes'] };
+const STATUS_OPTS = [['stock', 'In stock (sealed)'], ['open', 'Open / in use'], ['finished', 'Finished (empty)']];
+const low = v => String(v ?? '').trim().toLowerCase();
+function pkey(kind, x) {
+  if (!x) return '';
+  if (kind === 'bullet') return [low(x.maker), low(x.name), num0(x.weight), low(x.diameter)].join('|');
+  if (kind === 'powder') return [low(x.maker), low(x.name)].join('|');
+  return [low(x.maker), low(x.name), low(x.size)].join('|');
+}
+const compLeft = (kind, x) => kind === 'bullet' ? bulletLeft(x) : kind === 'powder' ? powderLeft(x) : primerLeft(x);
+const isFinished = x => !!x && x.status === 'finished';
+const sameProduct = (kind, ref) => S[KIND_COL[kind]].filter(x => pkey(kind, x) === pkey(kind, ref));
+/* The lot you're using now: the open one; else the oldest sealed lot with stock (first in, first out). */
+function activeLot(kind, refId) {
+  const ref = get(KIND_COL[kind], refId); if (!ref) return null;
+  const cands = sameProduct(kind, ref).filter(x => !isFinished(x));
+  const open = cands.filter(x => x.status === 'open').sort((a, b) => nat(b.openedOn || '', a.openedOn || '') || (b.created || 0) - (a.created || 0));
+  if (open.length) return open[0];
+  const stock = cands.filter(x => compLeft(kind, x) > 0).sort((a, b) => (a.created || 0) - (b.created || 0));
+  return stock[0] || cands[0] || ref;
+}
+const lotOf = (kind, b, l) => (b && b[kind + 'Lot'] && get(KIND_COL[kind], b[kind + 'Lot'])) || (l && activeLot(kind, l[kind + 'Id']));
+const lotLabel = (kind, x) => x ? `${kind === 'bullet' ? nBullet(x) : kind === 'powder' ? `${x.maker || ''} ${x.name || ''}`.trim() : nPrimer(x)}${x.lot ? ' · lot ' + x.lot : ''}` : '–';
+function packInfo(kind, x) {
+  if (isFinished(x)) return 'finished ' + (x.finishedOn || '');
+  const left = Math.max(0, compLeft(kind, x)), pq = +x.packQty || 0, w = PACK_WORD[kind];
+  if (!pq) return +x.packs > 1 ? `${x.packs} ${w[1]} bought` : '';
+  const full = Math.floor(left / pq + 1e-6), part = left - full * pq > pq * 0.002 ? 1 : 0, n = full + part;
+  if (!n) return 'empty — mark finished';
+  return `${n} ${n === 1 ? w[0] : w[1]}` + (part ? ` (1 open${full ? `, ${full} sealed` : ''})` : ' sealed');
+}
+const statusPillFor = x => x.status === 'open' ? pill('ok', 'OPEN') : x.status === 'finished' ? pill('', 'Finished') : pill('acc', 'In stock');
+/* Call after saving an item with a (possibly) new status. */
+function applyStatus(kind, item, prev) {
+  const st = item.status || 'stock';
+  if (st === 'finished' && prev !== 'finished') { item.writeOff = (+item.writeOff || 0) + Math.max(0, compLeft(kind, item)); item.finishedOn = today(); }
+  if (st !== 'finished' && prev === 'finished') { item.writeOff = 0; item.finishedOn = null; }
+  if (st === 'open' && prev !== 'open') {
+    item.openedOn = today();
+    sameProduct(kind, item).forEach(x => { if (x !== item && x.status === 'open') x.status = 'stock'; });
+  }
+}
+function dupGroups(kind) {
+  const m = new Map();
+  S[KIND_COL[kind]].filter(x => !isFinished(x) && low(x.lot)).forEach(x => { const k = pkey(kind, x) + '#' + low(x.lot); if (!m.has(k)) m.set(k, []); m.get(k).push(x); });
+  return [...m.values()].filter(g => g.length > 1);
+}
+function combineLots(kind, ids) {
+  const col = KIND_COL[kind], qk = QTY_KEY[kind];
+  const items = ids.map(id => get(col, id)).filter(Boolean); if (items.length < 2) return;
+  const keep = items.find(x => x.status === 'open') || items[0];
+  const rest = items.filter(x => x !== keep), restIds = rest.map(x => x.id);
+  let cost = 0, costQty = 0;
+  items.forEach(x => { const u = unitPrice(x); if (u != null) { cost += u * (+x[qk] || 0); costQty += +x[qk] || 0; } });
+  keep[qk] = items.reduce((a, x) => a + (+x[qk] || 0), 0);
+  keep.packs = items.reduce((a, x) => a + (+x.packs || 1), 0);
+  keep.writeOff = items.reduce((a, x) => a + (+x.writeOff || 0), 0);
+  if (costQty) { keep.price = +cost.toFixed(2); keep.priceQty = costQty; }
+  ['packQty', 'barcode', 'bc', 'diameter', 'size'].forEach(k => { if (keep[k] == null || keep[k] === '') { const s = rest.find(x => x[k] != null && x[k] !== ''); if (s) keep[k] = s[k]; } });
+  keep.notes = [...new Set(items.map(x => x.notes).filter(Boolean))].join('\n');
+  S.loads.forEach(l => { if (restIds.includes(l[kind + 'Id'])) l[kind + 'Id'] = keep.id; });
+  S.batches.forEach(b => { if (restIds.includes(b[kind + 'Lot'])) b[kind + 'Lot'] = keep.id; });
+  S[col] = S[col].filter(x => !restIds.includes(x.id));
+}
+function compListView(kind, act, newAct, sub, unit) {
+  const col = KIND_COL[kind], qk = QTY_KEY[kind];
+  const live = S[col].filter(x => !isFinished(x)), done = S[col].filter(isFinished);
+  const dups = dupGroups(kind).map(g => `<div class="alert">${g.length} entries are the same product and lot <b>${esc(lotLabel(kind, g[0]))}</b>. <button class="btn sm" data-act="combine" data-kind="${kind}" data-ids="${g.map(x => x.id).join(',')}">Combine</button></div>`).join('');
+  const cardFor = x => stockCard(act, x.id, lotLabel(kind, x), [...sub(x), packInfo(kind, x)], compLeft(kind, x), +x[qk] || 0, unit, statusPillFor(x));
+  return `<div class="btns"><button class="btn pri" data-act="${newAct}">+ New</button><button class="btn" data-act="scan" data-kind="${kind}">▦ Scan</button><button class="btn" data-act="photo" data-kind="${kind}">📷 Photo</button></div>
+    ${dups}${live.map(cardFor).join('') || empty('Nothing in stock.')}
+    ${done.length ? `<details class="card"><summary class="sub" style="cursor:pointer">Finished (${done.length}) — kept for history</summary>${done.map(cardFor).join('')}</details>` : ''}`;
+}
 
 function rule(br, k) { return br[k] != null && br[k] !== '' ? +br[k] : (S.settings[k] != null && S.settings[k] !== '' ? +S.settings[k] : null); }
 
@@ -339,12 +428,13 @@ function bulletForm(b, preset) {
       { k: 'diameter', label: 'Diameter / calibre', ph: '.308' },
       { k: 'bc', label: 'BC (G1/G7)', ph: 'G7 0.243' },
       { k: 'lot', label: 'Lot number', photo: true, full: true },
-      { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true, help: 'Add to this number each time you buy more (or use Scan packet). Stock left is worked out from batches loaded.' },
+      { k: 'status', label: 'Status', type: 'select', noBlank: true, options: STATUS_OPTS, def: 'stock', full: true, help: 'Open = the box you are loading from now. Finished = empty; any small difference is written off.' },
+      { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true, help: 'For this lot only. Same product with a different lot = a new entry. Stock left is worked out from batches loaded.' },
       ...priceFields('bullets', 100),
       ...scanFields('Bullets per box, e.g. 100'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { upsert('bullets', b, o); learn('bullet', o); },
+    onSave: o => { const prev = b ? b.status || 'stock' : 'stock'; const n = upsert('bullets', b, o); applyStatus('bullet', n, prev); learn('bullet', o); },
     onDelete: b && (() => inUse('loads use this bullet', S.loads.filter(l => l.bulletId === b.id).length) || remove('bullets', b.id))
   });
 }
@@ -355,12 +445,13 @@ function powderForm(p, preset) {
       { k: 'maker', label: 'Maker', req: true, ph: 'Somchem / Hodgdon' },
       { k: 'name', label: 'Powder', req: true, ph: 'S365 / Varget' },
       { k: 'lot', label: 'Lot number', photo: true, full: true, help: 'Add each new powder lot separately — burn rates vary between lots.' },
-      { k: 'grams', label: 'Total bought (grams)', type: 'num', full: true, help: 'e.g. 1 kg tub = 1000. Add to it when you buy more of the same lot.' },
+      { k: 'status', label: 'Status', type: 'select', noBlank: true, options: STATUS_OPTS, def: 'stock', full: true, help: 'Open = the tub you are loading from now. Finished = empty; the scale difference is written off.' },
+      { k: 'grams', label: 'Total bought (grams)', type: 'num', full: true, help: 'For this lot, e.g. one 1 kg tub = 1000; two tubs of the same lot = 2000.' },
       ...priceFields('grams', 1000),
       ...scanFields('Grams per container, e.g. 1000'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { upsert('powders', p, o); learn('powder', o); },
+    onSave: o => { const prev = p ? p.status || 'stock' : 'stock'; const n = upsert('powders', p, o); applyStatus('powder', n, prev); learn('powder', o); },
     onDelete: p && (() => inUse('loads use this powder', S.loads.filter(l => l.powderId === p.id).length) || remove('powders', p.id))
   });
 }
@@ -372,12 +463,13 @@ function primerForm(p, preset) {
       { k: 'name', label: 'Model', req: true, ph: 'BR2 / 210M' },
       { k: 'size', label: 'Type', type: 'select', options: PRIMER_SIZES },
       { k: 'lot', label: 'Lot number', photo: true, full: true },
-      { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true },
+      { k: 'status', label: 'Status', type: 'select', noBlank: true, options: STATUS_OPTS, def: 'stock', full: true },
+      { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true, help: 'For this lot only.' },
       ...priceFields('primers', 100),
       ...scanFields('Primers per box, e.g. 1000'),
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
-    onSave: o => { upsert('primers', p, o); learn('primer', o); },
+    onSave: o => { const prev = p ? p.status || 'stock' : 'stock'; const n = upsert('primers', p, o); applyStatus('primer', n, prev); learn('primer', o); },
     onDelete: p && (() => inUse('loads use this primer', S.loads.filter(l => l.primerId === p.id).length) || remove('primers', p.id))
   });
 }
@@ -439,9 +531,9 @@ function loadForm(l, copyFrom) {
     fields: [
       { k: 'name', label: 'Load name', full: true, ph: 'e.g. 308 168SMK S365 44.0' },
       { k: 'rifleId', label: 'Rifle', type: 'select', req: true, options: opts('rifles', nRifle), full: true },
-      { k: 'bulletId', label: 'Bullet', type: 'select', req: true, options: opts('bullets', nBullet), full: true },
-      { k: 'powderId', label: 'Powder', type: 'select', req: true, options: opts('powders', nPowder), full: true },
-      { k: 'primerId', label: 'Primer', type: 'select', req: true, options: opts('primers', nPrimer) },
+      { k: 'bulletId', label: 'Bullet', type: 'select', req: true, options: prodOpts('bullet', v.bulletId), full: true },
+      { k: 'powderId', label: 'Powder', type: 'select', req: true, options: prodOpts('powder', v.powderId), full: true },
+      { k: 'primerId', label: 'Primer', type: 'select', req: true, options: prodOpts('primer', v.primerId) },
       { k: 'brassId', label: 'Brass lot (default)', type: 'select', options: opts('brass', nBrass, b => !b.retired) },
       { k: 'charge', label: 'Charge (gr)', type: 'num', req: true },
       { k: 'maxCharge', label: 'Manual max (gr)', type: 'num', help: 'From your load manual' },
@@ -474,6 +566,9 @@ function batchForm(b, preset) {
   if (!S.loads.length) { alert('Create a load recipe first.'); location.hash = '#/loads'; return; }
   const v = b || { date: today(), sizing: 'neck', ...(preset || {}) };
   const rf = !b && preset && preset.rifleId ? get('rifles', preset.rifleId) : null;
+  const bl = b && get('loads', b.loadId);
+  if (b) ['bullet', 'powder', 'primer'].forEach(k => { if (!v[k + 'Lot']) { const x = lotOf(k, b, bl); if (x) v[k + 'Lot'] = x.id; } });
+  const lotFields = b && bl ? [{ type: 'section', label: 'Lots used' }, ...['bullet', 'powder', 'primer'].map(k => ({ k: k + 'Lot', label: k[0].toUpperCase() + k.slice(1) + ' lot', type: 'select', noBlank: true, full: true, options: sameProduct(k, get(KIND_COL[k], bl[k + 'Id']) || {}).map(x => [x.id, lotLabel(k, x) + (isFinished(x) ? ' (finished)' : '')]) }))] : [];
   if (!b && v.loadId && !v.brassId) { const l = get('loads', v.loadId); if (l && l.brassId) v.brassId = l.brassId; }
   openForm({
     title: b ? 'Edit batch ' + (b.no || '') : 'Load a batch' + (rf ? ' — ' + rf.name : ''), values: v, hintTop: true,
@@ -488,6 +583,7 @@ function batchForm(b, preset) {
       { k: 'trimmed', label: 'Trimmed', type: 'check' },
       { k: 'measuredLen', label: 'Case length measured', type: 'len' },
       { k: 'bump', label: 'Shoulder bump', ph: '0.002"' },
+      ...lotFields,
       { k: 'notes', label: 'Notes', type: 'textarea' }
     ],
     hint: o => {
@@ -497,11 +593,16 @@ function batchForm(b, preset) {
         const q = o.qty || 0;
         const bu = get('bullets', l.bulletId), pr = get('primers', l.primerId), pw = get('powders', l.powderId);
         const need = [];
-        const own = b && b.loadId === l.id ? +b.qty || 0 : 0;
-        if (bu && bulletLeft(bu) + (b && get('loads', b.loadId)?.bulletId === bu.id ? +b.qty || 0 : 0) < q) need.push('bullets');
-        if (pr && primerLeft(pr) + (b && get('loads', b.loadId)?.primerId === pr.id ? +b.qty || 0 : 0) < q) need.push('primers');
-        if (pw && powderLeft(pw) + own * (+l.charge || 0) * GR_TO_G < q * (+l.charge || 0) * GR_TO_G) need.push('powder');
-        h += `<div class="card" style="margin-bottom:8px"><div class="sub">${esc(nBullet(bu))} · ${esc(nPowder(pw))} <b>${fx(l.charge, 2)}gr</b> · ${esc(nPrimer(pr))}${l.cbto != null ? ` · CBTO ${fLen(l.cbto)}` : ''}${l.coal != null ? ` · COAL ${fLen(l.coal)}` : ''}</div>${q ? `<div class="sub">Uses ${fx(q * (l.charge || 0) * GR_TO_G, 1)} g powder</div>` : ''}</div>`;
+        const prodLeft = (k, ref) => ref ? sameProduct(k, ref).filter(x => !isFinished(x)).reduce((t, x) => t + Math.max(0, compLeft(k, x)), 0) : Infinity;
+        if (!b) {
+          if (prodLeft('bullet', bu) < q) need.push('bullets');
+          if (prodLeft('primer', pr) < q) need.push('primers');
+          if (prodLeft('powder', pw) < q * (+l.charge || 0) * GR_TO_G) need.push('powder');
+          const lots = ['bullet', 'powder', 'primer'].map(k => [k, lotOf(k, null, l)]);
+          h += `<div class="sub" style="margin-bottom:6px">Lots used (the open ones): ${lots.map(([k, x]) => `<b>${esc(lotLabel(k, x))}</b>${x && x.status !== 'open' ? ' <span class="pill acc">will be opened</span>' : ''}`).join(' · ')}</div>`;
+          lots.forEach(([k, x]) => { if (!x) return; const left = compLeft(k, x), use = k === 'powder' ? q * (+l.charge || 0) * GR_TO_G : q; if (q && left < use && prodLeft(k, x) >= use) h += `<div class="alert">The open ${k} lot has only ${fx(left, 0)}${k === 'powder' ? ' g' : ''} left. If it runs out, load the rest as a second batch after opening the next lot.</div>`; });
+        }
+        h += `<div class="card" style="margin-bottom:8px"><div class="sub">${esc(nBullet(bu))} · ${esc(pw ? lotLabel('powder', { ...pw, lot: '' }) : '?')} <b>${fx(l.charge, 2)}gr</b> · ${esc(nPrimer(pr))}${l.cbto != null ? ` · CBTO ${fLen(l.cbto)}` : ''}${l.coal != null ? ` · COAL ${fLen(l.coal)}` : ''}</div>${q ? `<div class="sub">Uses ${fx(q * (l.charge || 0) * GR_TO_G, 1)} g powder</div>` : ''}</div>`;
         const c = roundCost(l, o.brassId);
         if (c && c.total != null) h += `<div class="sub" style="margin-bottom:6px">Cost ≈ <b>${money(c.total)}</b> per round${q ? ` · <b>${money(c.total * q)}</b> for ${q}` : ''}${costNote(c)}</div>`;
         if (need.length) h += `<div class="alert">Stock recorded is too low for: ${need.join(', ')}. Update stock under Setup if you've bought more.</div>`;
@@ -522,7 +623,16 @@ function batchForm(b, preset) {
       const reprice = !b || !b.cost || b.cost.missing.length || b.loadId !== o.loadId || b.brassId !== o.brassId;
       const n = upsert('batches', b, o);
       if (!n.no) n.no = batchNo(n);
-      if (reprice) { const c = roundCost(get('loads', n.loadId), n.brassId); if (c && c.total != null) n.cost = c; }
+      const nl = get('loads', n.loadId);
+      ['bullet', 'powder', 'primer'].forEach(k => {
+        let x = n[k + 'Lot'] && get(KIND_COL[k], n[k + 'Lot']);
+        if (!x || pkey(k, x) !== pkey(k, get(KIND_COL[k], nl[k + 'Id']))) x = lotOf(k, null, nl);
+        if (!x) return;
+        if (n[k + 'Lot'] !== x.id && b) n.cost = null;
+        n[k + 'Lot'] = x.id;
+        if (!b && x.status !== 'open' && !isFinished(x)) { const prev = x.status || 'stock'; x.status = 'open'; applyStatus(k, x, prev); }
+      });
+      if (reprice || !n.cost) { const c = roundCost(nl, n.brassId, n); if (c && c.total != null) n.cost = c; }
       return b ? null : { go: '#/batch/' + n.id };
     },
     onDelete: b && (() => inUse('range strings were shot from this batch', allStrings().filter(s => s.batchId === b.id).length) || remove('batches', b.id)),
@@ -595,9 +705,9 @@ function ladderForm() {
       { k: 'tag', label: 'Series name', req: true, full: true, ph: 'e.g. 308 S365 ladder Nov' },
       { k: 'vary', label: 'Vary', type: 'select', noBlank: true, full: true, options: [['charge', 'Powder charge'], ['cbto', 'Seating depth (CBTO)']] },
       { k: 'rifleId', label: 'Rifle', type: 'select', req: true, options: opts('rifles', nRifle), full: true },
-      { k: 'bulletId', label: 'Bullet', type: 'select', req: true, options: opts('bullets', nBullet), full: true },
-      { k: 'powderId', label: 'Powder', type: 'select', req: true, options: opts('powders', nPowder), full: true },
-      { k: 'primerId', label: 'Primer', type: 'select', req: true, options: opts('primers', nPrimer) },
+      { k: 'bulletId', label: 'Bullet', type: 'select', req: true, options: prodOpts('bullet'), full: true },
+      { k: 'powderId', label: 'Powder', type: 'select', req: true, options: prodOpts('powder'), full: true },
+      { k: 'primerId', label: 'Primer', type: 'select', req: true, options: prodOpts('primer') },
       { k: 'maxCharge', label: 'Manual max (gr)', type: 'num', req: true },
       { k: 'source', label: 'Data source', full: true, req: true, ph: 'Manual & page' },
       { type: 'section', label: 'Steps' },
@@ -706,10 +816,10 @@ function stockInForm(code, prod, extra) {
       if (!(add > 0)) return 'Enter packs and pack size.';
       prod.packQty = o.packQty;
       let item = o.itemId !== 'new' ? get(K.col, o.itemId) : null;
-      if (item && prod.kind === 'powder' && o.lot && item.lot && o.lot !== item.lot) return `This tub is lot ${o.lot} but the entry is lot ${item.lot}. Choose "+ New lot".`;
-      if (item) { item[K.qty] = (+item[K.qty] || 0) + add; if (o.lot && !item.lot) item.lot = o.lot; }
+      if (item && prod.kind !== 'brass' && o.lot && item.lot && low(o.lot) !== low(item.lot)) return `This packet is lot ${o.lot} but that entry is lot ${item.lot}. Choose "+ New lot".`;
+      if (item) { item[K.qty] = (+item[K.qty] || 0) + add; item.packs = (+item.packs || 1) + o.packs; if (o.lot && !item.lot) item.lot = o.lot; if (item.status === 'finished') { item.status = 'stock'; item.finishedOn = null; } }
       else {
-        item = upsert(K.col, null, { ...prod.values, barcode: code, packQty: o.packQty, lot: o.lot, [K.qty]: add });
+        item = upsert(K.col, null, { ...prod.values, barcode: code, packQty: o.packQty, packs: o.packs, lot: o.lot, status: 'stock', [K.qty]: add });
         if (prod.kind === 'brass') item.name = o.name || `${prod.values.headstamp || 'Brass'} ${prod.values.calibre || ''} – ${o.lot || today()}`.replace(/\s+/g, ' ');
       }
       if (o.packPrice > 0) { item.price = o.packPrice; item.priceQty = o.packQty; }
@@ -880,9 +990,16 @@ const views = {
     const alerts = [];
     S.brass.filter(b => !b.retired).forEach(b => brassState(b).alerts.forEach(([c, t]) => alerts.push(`<a class="alert ${c}" style="display:block;color:inherit;text-decoration:none" href="#/brasslot/${b.id}"><b>${esc(b.name)}</b> — ${esc(t)}</a>`)));
     const st = S.settings;
-    S.bullets.forEach(b => { const n = bulletLeft(b); if ((+b.qtyBought || 0) > 0 && n < (st.lowBullets ?? 0)) alerts.push(`<div class="alert">${esc(nBullet(b))}: ${n} bullets left</div>`); });
-    S.primers.forEach(p => { const n = primerLeft(p); if ((+p.qtyBought || 0) > 0 && n < (st.lowPrimers ?? 0)) alerts.push(`<div class="alert">${esc(nPrimer(p))}: ${n} primers left</div>`); });
-    S.powders.forEach(p => { const n = powderLeft(p); if ((+p.grams || 0) > 0 && n < (st.lowPowderG ?? 0)) alerts.push(`<div class="alert">${esc(nPowder(p))}: ${fx(n, 0)} g left</div>`); });
+    [['bullet', st.lowBullets, ' bullets'], ['primer', st.lowPrimers, ' primers'], ['powder', st.lowPowderG, ' g']].forEach(([kind, lim, unit]) => {
+      const seen = new Set();
+      S[KIND_COL[kind]].filter(x => !isFinished(x)).forEach(x => {
+        const k = pkey(kind, x); if (seen.has(k)) return; seen.add(k);
+        const grp = sameProduct(kind, x).filter(y => !isFinished(y));
+        const bought = grp.reduce((t, y) => t + (+y[QTY_KEY[kind]] || 0), 0), left = grp.reduce((t, y) => t + Math.max(0, compLeft(kind, y)), 0);
+        if (bought > 0 && left < (lim ?? 0)) alerts.push(`<a class="alert" style="display:block;color:inherit;text-decoration:none" href="#/${KIND_COL[kind]}">Low stock: ${esc(lotLabel(kind, { ...x, lot: '' }))} — ${fx(left, 0)}${unit} left</a>`);
+      });
+      S[KIND_COL[kind]].filter(x => x.status === 'open' && compLeft(kind, x) <= (kind === 'powder' ? 5 : 0)).forEach(x => alerts.push(`<a class="alert" style="display:block;color:inherit;text-decoration:none" href="#/${KIND_COL[kind]}">${esc(lotLabel(kind, x))} looks used up — open it and set Status to Finished.</a>`));
+    });
     const ready = S.batches.filter(b => batchLeft(b) > 0).sort(byDate).reverse();
     const recent = [...S.sessions].sort(byDate).reverse().slice(0, 3);
     const first = !S.rifles.length;
@@ -974,7 +1091,8 @@ const views = {
     return `<div class="card"><div class="ttl">${esc(nLoad(l))}</div><div class="sub">Batch <b>${esc(b.no || '–')}</b> · loaded ${esc(b.date)}</div>
       <div class="kv"><div>Loaded<b>${b.qty}</b></div><div>Fired<b>${batchFired(b.id)}</b></div><div>Left<b>${batchLeft(b)}</b></div>
       <div>Brass lot<b>${esc(nBrass(get('brass', b.brassId)))}</b></div><div>Sizing<b>${esc((SIZING.find(s => s[0] === b.sizing) || [, '–'])[1])}</b></div>
-      <div>Annealed<b>${b.annealed ? 'Yes' : 'No'}</b></div><div>Trimmed<b>${b.trimmed ? 'Yes' : 'No'}</b></div><div>Case length<b>${fLen(b.measuredLen)}</b></div><div>Bump<b>${esc(b.bump || '–')}</b></div></div>
+      <div>Annealed<b>${b.annealed ? 'Yes' : 'No'}</b></div><div>Trimmed<b>${b.trimmed ? 'Yes' : 'No'}</b></div><div>Case length<b>${fLen(b.measuredLen)}</b></div><div>Bump<b>${esc(b.bump || '–')}</b></div>
+      ${['bullet', 'powder', 'primer'].map(k => `<div>${k[0].toUpperCase() + k.slice(1)} lot<b>${esc((x => x ? (x.lot || 'no lot no.') : '–')(lotOf(k, b, l)))}</b></div>`).join('')}</div>
       ${b.notes ? `<div class="note">${esc(b.notes)}</div>` : ''}</div>
       <div class="btns"><a class="btn" href="#/load/${b.loadId}" style="text-decoration:none;text-align:center">View load</a><button class="btn" data-act="editBatch" data-id="${b.id}">Edit</button></div>
       <h2>Cost</h2>${(c => costBreakdown(c, c && c.total != null ? `<div>Whole batch<b>${money(c.total * (+b.qty || 0))}</b></div><div>Fired so far<b>${money(c.total * batchFired(b.id))}</b></div>` : ''))(batchCost(b))}
@@ -1031,19 +1149,13 @@ const views = {
   rifles() {
     return `<div class="btns"><button class="btn pri" data-act="newRifle">+ New rifle</button></div>${S.rifles.map(r => `<div class="card" data-act="editRifle" data-id="${r.id}" style="cursor:pointer"><div class="ttl">${esc(r.name)}</div><div class="sub">${esc([r.calibre, r.twist && 'twist ' + r.twist, r.barrel, r.optic].filter(Boolean).join(' · '))}</div><div class="kv"><div>Round count<b>${rifleRounds(r)}</b></div><div>Loads<b>${S.loads.filter(l => l.rifleId === r.id).length}</b></div></div></div>`).join('') || empty('No rifles yet.')}`;
   },
-  bullets() {
-    return `<div class="btns"><button class="btn pri" data-act="newBullet">+ New bullet</button><button class="btn" data-act="scan" data-kind="bullet">▦ Scan</button><button class="btn" data-act="photo" data-kind="bullet">📷 Photo</button></div>${S.bullets.map(b => stockCard('editBullet', b.id, nBullet(b), [b.diameter, b.bc, b.lot && 'lot ' + b.lot, unitPrice(b) != null && money(unitPrice(b)) + ' each'], bulletLeft(b), +b.qtyBought || 0, '')).join('') || empty('No bullets yet.')}`;
-  },
-  powders() {
-    return `<div class="btns"><button class="btn pri" data-act="newPowder">+ New powder</button><button class="btn" data-act="scan" data-kind="powder">▦ Scan</button><button class="btn" data-act="photo" data-kind="powder">📷 Photo</button></div>${S.powders.map(p => stockCard('editPowder', p.id, nPowder(p), [unitPrice(p) != null && money(unitPrice(p) * 1000) + ' per kg'], powderLeft(p), +p.grams || 0, ' g')).join('') || empty('No powders yet.')}`;
-  },
-  primers() {
-    return `<div class="btns"><button class="btn pri" data-act="newPrimer">+ New primer</button><button class="btn" data-act="scan" data-kind="primer">▦ Scan</button><button class="btn" data-act="photo" data-kind="primer">📷 Photo</button></div>${S.primers.map(p => stockCard('editPrimer', p.id, nPrimer(p), [p.size, p.lot && 'lot ' + p.lot, unitPrice(p) != null && money(unitPrice(p)) + ' each'], primerLeft(p), +p.qtyBought || 0, '')).join('') || empty('No primers yet.')}`;
-  }
+  bullets() { return compListView('bullet', 'editBullet', 'newBullet', b => [b.diameter, b.bc, unitPrice(b) != null && money(unitPrice(b)) + ' each'], ''); },
+  powders() { return compListView('powder', 'editPowder', 'newPowder', p => [unitPrice(p) != null && money(unitPrice(p) * 1000) + ' per kg'], ' g'); },
+  primers() { return compListView('primer', 'editPrimer', 'newPrimer', p => [p.size, unitPrice(p) != null && money(unitPrice(p)) + ' each'], ''); }
 };
-function stockCard(act, id, title, sub, left, total, unit) {
+function stockCard(act, id, title, sub, left, total, unit, badge) {
   const pct = total ? Math.max(0, Math.min(100, left / total * 100)) : 0;
-  return `<div class="card" data-act="${act}" data-id="${id}" style="cursor:pointer"><div class="row"><div class="grow"><div class="ttl">${esc(title)}</div><div class="sub">${esc(sub.filter(Boolean).join(' · '))}</div></div><div class="ttl mono">${fx(left, 0)}${unit}</div></div>${total ? `<div class="bar"><i style="width:${pct}%"></i></div><div class="sub">of ${fx(total, 0)}${unit} bought</div>` : ''}</div>`;
+  return `<div class="card" data-act="${act}" data-id="${id}" style="cursor:pointer"><div class="row"><div class="grow"><div class="ttl">${esc(title)} ${badge || ''}</div><div class="sub">${esc(sub.filter(Boolean).join(' · '))}</div></div><div class="ttl mono">${fx(left, 0)}${unit}</div></div>${total ? `<div class="bar"><i style="width:${pct}%"></i></div><div class="sub">of ${fx(total, 0)}${unit} bought</div>` : ''}</div>`;
 }
 function batchCard(b) {
   const left = batchLeft(b);
@@ -1140,6 +1252,11 @@ const ACTIONS = {
   export: () => download(`reload-log-backup-${today()}.json`, JSON.stringify({ ...S, exported: new Date().toISOString(), app: APP_VERSION }, null, 1), 'application/json'),
   import: () => $('#importfile').click(),
   csv: () => csvExport(),
+  combine: async d => {
+    const ids = d.ids.split(','), k = d.kind, items = ids.map(id => get(KIND_COL[k], id)).filter(Boolean);
+    if (!confirm(`Combine ${items.length} entries of ${lotLabel(k, items[0])} into one? Stock, prices, recipes and batches are merged.`)) return;
+    combineLots(k, ids); await save(); render();
+  },
   sheetCsv: () => {
     const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const rows = [['Date', 'Batch', 'Rifle', 'Load', 'Bullet', 'Powder', 'Charge gr', 'Primer', 'Brass lot', 'Qty loaded', 'Fired', 'Left', 'Sizing', 'Annealed', 'Notes']];
