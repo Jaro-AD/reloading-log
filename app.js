@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.9.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -37,7 +37,7 @@ const SORTS = {
   bullets: by((a, b) => calKey(a.diameter) - calKey(b.diameter), (a, b) => num0(a.weight) - num0(b.weight), (a, b) => nat(a.maker, b.maker), (a, b) => nat(a.name, b.name), (a, b) => nat(a.lot, b.lot)),
   powders: by((a, b) => nat(a.maker, b.maker), (a, b) => nat(a.name, b.name), (a, b) => nat(a.lot, b.lot)),
   primers: by((a, b) => (PRIMER_ORDER.indexOf(a.size) + 1 || 99) - (PRIMER_ORDER.indexOf(b.size) + 1 || 99), (a, b) => nat(a.maker, b.maker), (a, b) => nat(a.name, b.name), (a, b) => nat(a.lot, b.lot)),
-  brass: by((a, b) => calKey(a.calibre) - calKey(b.calibre), (a, b) => nat(a.name, b.name)),
+  brass: by((a, b) => calKey(a.calibre) - calKey(b.calibre), (a, b) => num0(a.userLot) - num0(b.userLot), (a, b) => nat(a.name, b.name)),
   loads: by((a, b) => nat(nLoad(a), nLoad(b)), (a, b) => num0(a.charge) - num0(b.charge)),
   batches: byDate, sessions: byDate
 };
@@ -125,7 +125,11 @@ const nRifle = r => r ? r.name + (r.calibre ? ` (${r.calibre})` : '') : '?';
 const nBullet = b => b ? `${b.maker || ''} ${b.weight ?? ''}gr ${b.name || ''}`.trim() : '?';
 const nPowder = p => p ? `${p.maker || ''} ${p.name || ''}`.trim() + (p.lot ? ` · lot ${p.lot}` : '') : '?';
 const nPrimer = p => p ? `${p.maker || ''} ${p.name || ''}`.trim() : '?';
-const nBrass = b => b ? b.name + (b.mark ? ` [${b.mark}]` : '') : '?';
+/* Brass lots are known by YOUR lot number (1, 2, 3…); the maker's lot number is kept alongside. */
+const brassTitle = b => b ? [b.userLot != null && b.userLot !== '' ? 'Lot ' + b.userLot : null, [b.headstamp, b.calibre].filter(Boolean).join(' ') || null, b.name || null].filter(Boolean).join(' · ') || 'Brass' : '?';
+const nBrass = b => b ? brassTitle(b) + (b.mark ? ` [${b.mark}]` : '') : '?';
+const nextUserLot = () => S.brass.reduce((m, b) => Math.max(m, +b.userLot || 0), 0) + 1;
+function numberBrass() { [...S.brass].sort((a, b) => (a.created || 0) - (b.created || 0)).forEach(b => { if (b.userLot == null || b.userLot === '') b.userLot = nextUserLot(); }); }
 const nLoad = l => l ? (l.name || `${fx(l.charge, 1)}gr ${nPowder(get('powders', l.powderId))}`) : '?';
 const nBatch = b => { if (!b) return '?'; const l = get('loads', b.loadId); return `${b.date} · ${nLoad(l)}`; };
 
@@ -476,15 +480,16 @@ function primerForm(p, preset) {
 function brassForm(br, preset) {
   const d = S.settings;
   openForm({
-    title: br ? 'Edit brass lot' : 'New brass lot', values: br || preset,
+    title: br ? 'Edit brass lot' : 'New brass lot', values: br || { userLot: nextUserLot(), ...(preset || {}) },
     fields: [
-      { k: 'name', label: 'Lot name', req: true, full: true, ph: 'e.g. Lapua 308 – Lot A' },
-      { k: 'mark', label: 'Case marking / box label', full: true, ph: 'e.g. 1 red dot on head · box "308-A"', help: 'How you tell this lot apart physically — mark the case heads and label the box' },
+      { k: 'userLot', label: 'Your lot no.', type: 'num', req: true, help: br ? 'Your own number for this lot' : 'Next free number filled in' },
+      { k: 'calibre', label: 'Calibre', req: true, ph: '.308 Win' },
       { k: 'headstamp', label: 'Headstamp / maker', ph: 'Lapua' },
+      { k: 'count', label: br ? 'Number of cases' : 'Number of cases (total)', type: 'num', req: true },
       { k: 'makerLot', label: "Maker's lot number", photo: true, full: true },
-      { k: 'calibre', label: 'Calibre', ph: '.308 Win' },
-      { k: 'count', label: 'Number of cases', type: 'num' },
-      ...(br ? [] : [{ k: 'splitSize', label: 'Split into lots of', type: 'num', full: true, ph: 'e.g. 50', help: 'Optional. A box of 100 split into lots of 50 makes "<name> – 1" and "<name> – 2", each tracked separately.' }]),
+      ...(br ? [] : [{ k: 'splitSize', label: 'Work in batches of (cases per lot)', type: 'num', full: true, ph: 'e.g. 50, 75, 100, 200', help: 'Optional. Splits the cases into lots with your next lot numbers, e.g. 100 cases in batches of 50 = Lot 1 and Lot 2. For one lot bigger than a box (e.g. 200), enter Number of cases = 200 and leave this blank.' }]),
+      { k: 'mark', label: 'Case marking / box label', full: true, ph: 'e.g. 1 dot on head · "Lot 1" on box', help: 'How you tell this lot apart physically' },
+      { k: 'name', label: 'Description (optional)', full: true, ph: 'e.g. bought Nov 2026, once-fired' },
       { k: 'rifleId', label: 'Fire-formed to rifle', type: 'select', options: opts('rifles', nRifle) },
       { type: 'section', label: 'History when added (0 for new brass)' },
       { k: 'initFirings', label: 'Times fired', type: 'num', def: 0 },
@@ -504,9 +509,11 @@ function brassForm(br, preset) {
     ],
     onSave: o => {
       const split = o.splitSize; delete o.splitSize;
-      if (!br && split > 0 && o.count > split) {
-        const parts = Math.ceil(o.count / split);
-        for (let i = 1; i <= parts; i++) upsert('brass', null, { ...o, name: `${o.name} – ${i}`, count: Math.min(split, o.count - split * (i - 1)), mark: o.mark ? `${o.mark} · lot ${i}` : `Lot ${i}` });
+      if (o.count <= 0) return 'Number of cases must be more than 0.';
+      const parts = !br && split > 0 && o.count > split ? Math.ceil(o.count / split) : 1;
+      for (let i = 0; i < parts; i++) { const taken = S.brass.find(x => x !== br && +x.userLot === o.userLot + i); if (taken) return `Lot no. ${o.userLot + i} is already used (${brassTitle(taken)}). Choose another number.`; }
+      if (parts > 1) {
+        for (let i = 0; i < parts; i++) upsert('brass', null, { ...o, userLot: o.userLot + i, count: Math.min(split, o.count - split * i), mark: o.mark || `Lot ${o.userLot + i}` });
         learn('brass', o); return { go: '#/brass' };
       }
       const n = upsert('brass', br, o); learn('brass', o); return br ? null : { go: '#/brasslot/' + n.id };
@@ -568,7 +575,7 @@ function loadForm(l, copyFrom) {
 function brassHint(brassId) {
   const br = get('brass', brassId); if (!br) return '';
   const st = brassState(br);
-  const head = `<div class="sub" style="margin-bottom:6px">${esc(br.name)}: fired ${st.firings}×, ${st.neck} neck size(s) since FL, ${st.anneal} firing(s) since anneal${st.loaded ? ` · <b>${st.loaded} still loaded</b>` : ''}</div>`;
+  const head = `<div class="sub" style="margin-bottom:6px">${esc(brassTitle(br))}: fired ${st.firings}×, ${st.neck} neck size(s) since FL, ${st.anneal} firing(s) since anneal${st.loaded ? ` · <b>${st.loaded} still loaded</b>` : ''}</div>`;
   return head + (st.alerts.length ? st.alerts.map(([c, t]) => `<div class="alert ${c}">${esc(t)}</div>`).join('') : '<div class="alert ok">No brass work due.</div>');
 }
 function batchForm(b, preset) {
@@ -817,7 +824,7 @@ function stockInForm(code, prod, extra) {
       { k: 'packs', label: 'Number of packs', type: 'num', req: true },
       { k: 'packQty', label: `Per pack (${K.unit})`, type: 'num', req: true },
       { k: 'packPrice', label: `Price per pack (${cur()})`, type: 'num', full: true, help: 'Optional — updates the price used for cost per round' },
-      ...(prod.kind === 'brass' ? [{ k: 'name', label: 'Lot name (for new lot)', full: true, ph: `${prod.values.headstamp || ''} ${prod.values.calibre || ''} – Lot B`.trim() }] : [])
+      ...(prod.kind === 'brass' ? [{ k: 'userLot', label: 'Your lot no. (for a new lot)', type: 'num', def: nextUserLot() }] : [])
     ],
     hint: o => o.packs && o.packQty ? `<div class="alert ok">Adds <b>${fx(o.packs * o.packQty, 0)} ${K.unit}</b>${o.itemId === 'new' ? ' as a new entry' : ''}.</div>` : '',
     onSave: o => {
@@ -829,7 +836,7 @@ function stockInForm(code, prod, extra) {
       if (item) { item[K.qty] = (+item[K.qty] || 0) + add; item.packs = (+item.packs || 1) + o.packs; if (o.lot && !item.lot) item.lot = o.lot; if (item.status === 'finished') { item.status = 'stock'; item.finishedOn = null; } }
       else {
         item = upsert(K.col, null, { ...prod.values, barcode: code, packQty: o.packQty, packs: o.packs, lot: o.lot, status: 'stock', [K.qty]: add });
-        if (prod.kind === 'brass') item.name = o.name || `${prod.values.headstamp || 'Brass'} ${prod.values.calibre || ''} – ${o.lot || today()}`.replace(/\s+/g, ' ');
+        if (prod.kind === 'brass') { item.userLot = o.userLot || nextUserLot(); item.makerLot = o.lot; item.lot = undefined; }
       }
       if (o.packPrice > 0) { item.price = o.packPrice; item.priceQty = o.packQty; }
       return { go: prod.kind === 'brass' ? '#/brasslot/' + item.id : '#/' + K.col };
@@ -912,7 +919,7 @@ function applyPhotoData(d, kindHint) {
   if (kind === 'bullet') p = { ...base, weight: num(d.weight_gr), diameter: d.diameter || '', bc: d.bc || '', qtyBought: q, packQty: q };
   if (kind === 'primer') p = { ...base, size: PRIMER_SIZES.some(x => x[0] === d.primer_type) ? d.primer_type : '', qtyBought: q, packQty: q };
   if (kind === 'powder') { const g = q == null ? null : unit === 'kg' ? q * 1000 : unit === 'lb' ? Math.round(q * 453.59) : q; p = { ...base, grams: g, packQty: g }; }
-  if (kind === 'brass') p = { _intro: intro, barcode: code, headstamp: d.maker || '', calibre: d.calibre || '', count: q, packQty: q, makerLot: d.lot || '', name: `${d.maker || ''} ${d.calibre || ''} – Lot A`.replace(/\s+/g, ' ').trim() };
+  if (kind === 'brass') p = { _intro: intro, barcode: code, headstamp: d.maker || '', calibre: d.calibre || '', count: q, packQty: q, makerLot: d.lot || '' };
   KINDS[kind].form(null, p);
 }
 async function callVision(file, prompt, maxTokens) {
@@ -997,7 +1004,7 @@ function loadCard(l) {
 const views = {
   home() {
     const alerts = [];
-    S.brass.filter(b => !b.retired).forEach(b => brassState(b).alerts.forEach(([c, t]) => alerts.push(`<a class="alert ${c}" style="display:block;color:inherit;text-decoration:none" href="#/brasslot/${b.id}"><b>${esc(b.name)}</b> — ${esc(t)}</a>`)));
+    S.brass.filter(b => !b.retired).forEach(b => brassState(b).alerts.forEach(([c, t]) => alerts.push(`<a class="alert ${c}" style="display:block;color:inherit;text-decoration:none" href="#/brasslot/${b.id}"><b>${esc(brassTitle(b))}</b> — ${esc(t)}</a>`)));
     const st = S.settings;
     [['bullet', st.lowBullets, ' bullets'], ['primer', st.lowPrimers, ' primers'], ['powder', st.lowPowderG, ' g']].forEach(([kind, lim, unit]) => {
       const seen = new Set();
@@ -1091,7 +1098,7 @@ const views = {
       <div class="card kv" style="margin-top:0"><div>Total loaded<b>${all}</b></div><div>Fired<b>${all - left}</b></div><div>Loaded &amp; ready<b>${left}</b></div><div>Batches<b>${rows.length}</b></div></div>
       ${tot('Totals by load', sum((b, l) => nLoad(l) + (rf ? '' : ' · ' + ((get('rifles', l.rifleId) || {}).name || ''))))}
       ${tot('Totals by bullet', sum((b, l) => nBullet(get('bullets', l.bulletId))))}
-      <h2>Loading log</h2>${rows.length ? `<div class="tblwrap"><table><tr><th>Date</th><th>Batch</th>${rf ? '' : '<th>Rifle</th>'}<th>Load</th><th>Bullet</th><th>Charge</th><th>Qty</th><th>Left</th><th>Brass</th></tr>${rows.map(({ b, l }) => `<tr data-go="#/batch/${b.id}"><td>${esc(b.date)}</td><td>${esc(b.no || '')}</td>${rf ? '' : `<td>${esc((get('rifles', l.rifleId) || {}).name || '')}</td>`}<td>${esc(nLoad(l))}</td><td>${esc(nBullet(get('bullets', l.bulletId)))}</td><td>${fx(l.charge, 1)}gr</td><td>${b.qty}</td><td>${batchLeft(b)}</td><td>${esc((get('brass', b.brassId) || {}).name || '')}</td></tr>`).join('')}</table></div>` : empty('No batches loaded yet.')}`;
+      <h2>Loading log</h2>${rows.length ? `<div class="tblwrap"><table><tr><th>Date</th><th>Batch</th>${rf ? '' : '<th>Rifle</th>'}<th>Load</th><th>Bullet</th><th>Charge</th><th>Qty</th><th>Left</th><th>Brass</th></tr>${rows.map(({ b, l }) => `<tr data-go="#/batch/${b.id}"><td>${esc(b.date)}</td><td>${esc(b.no || '')}</td>${rf ? '' : `<td>${esc((get('rifles', l.rifleId) || {}).name || '')}</td>`}<td>${esc(nLoad(l))}</td><td>${esc(nBullet(get('bullets', l.bulletId)))}</td><td>${fx(l.charge, 1)}gr</td><td>${b.qty}</td><td>${batchLeft(b)}</td><td>${esc(brassTitle(get('brass', b.brassId)))}</td></tr>`).join('')}</table></div>` : empty('No batches loaded yet.')}`;
   },
   batch(q, id) {
     const b = get('batches', id); if (!b) return empty('Batch not found.');
@@ -1134,7 +1141,7 @@ const views = {
   brasslot(q, id) {
     const br = get('brass', id); if (!br) return empty('Brass lot not found.');
     const st = brassState(br);
-    return `<div class="card"><div class="ttl">${esc(br.name)}</div>${br.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(br.mark)}</div>` : ''}<div class="sub">${esc([br.headstamp, br.calibre, br.count ? br.count + ' cases' : '', br.makerLot ? 'maker lot ' + br.makerLot : ''].filter(Boolean).join(' · '))}</div>
+    return `<div class="card"><div class="ttl">${esc(brassTitle(br))}</div>${br.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(br.mark)}</div>` : ''}<div class="sub">${esc([br.headstamp, br.calibre, br.count ? br.count + ' cases' : '', br.makerLot ? 'maker lot ' + br.makerLot : ''].filter(Boolean).join(' · '))}</div>
       <div class="kv"><div>Times fired<b>${st.firings}</b></div><div>Neck sizes since FL<b>${st.neck}${st.flAfter != null ? ' / ' + st.flAfter : ''}</b></div><div>Firings since anneal<b>${st.anneal}${st.annealEvery ? ' / ' + st.annealEvery : ''}</b></div>
       <div>Retire at<b>${st.retireAt || '–'}</b></div><div>Last length<b>${fLen(st.lastLen)}</b></div><div>Max / trim-to<b>${fLen(br.maxLen)} / ${fLen(br.trimTo)}</b></div><div>Last trimmed<b>${esc(st.lastTrim || '–')}</b></div><div>Currently loaded<b>${st.loaded}</b></div></div>
       ${br.notes ? `<div class="note">${esc(br.notes)}</div>` : ''}</div>
@@ -1176,7 +1183,7 @@ function sessionCard(s) {
 }
 function brassCard(b) {
   const st = brassState(b);
-  return card('#/brasslot/' + b.id, `<div class="ttl">${esc(b.name)}${b.count ? ` <span class="sub">· ${b.count} cases</span>` : ''}</div>${b.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(b.mark)}</div>` : ''}${unitPrice(b) != null ? `<div class="sub">${money(unitPrice(b))}/case · ${money(unitPrice(b) / brassLife(b))} per firing</div>` : ''}<div class="sub">Fired ${st.firings}× · ${st.neck} neck since FL · ${st.anneal} since anneal${st.loaded ? ` · ${st.loaded} loaded` : ''}</div><div style="margin-top:6px">${st.alerts.map(([c, t]) => pill(c, t.split(' (')[0].split(':')[0])).join(' ') || pill('ok', 'Nothing due')}</div>`);
+  return card('#/brasslot/' + b.id, `<div class="ttl">${esc(brassTitle(b))}${b.count ? ` <span class="sub">· ${b.count} cases</span>` : ''}</div>${b.mark || b.makerLot ? `<div class="sub" style="color:var(--acc)">${esc([b.mark && 'Mark: ' + b.mark, b.makerLot && "Maker's lot " + b.makerLot].filter(Boolean).join(' · '))}</div>` : ''}${unitPrice(b) != null ? `<div class="sub">${money(unitPrice(b))}/case · ${money(unitPrice(b) / brassLife(b))} per firing</div>` : ''}<div class="sub">Fired ${st.firings}× · ${st.neck} neck since FL · ${st.anneal} since anneal${st.loaded ? ` · ${st.loaded} loaded` : ''}</div><div style="margin-top:6px">${st.alerts.map(([c, t]) => pill(c, t.split(' (')[0].split(':')[0])).join(' ') || pill('ok', 'Nothing due')}</div>`);
 }
 function chart(pts, xt, yt, xl, withErr) {
   const W = 340, H = 200, L = 46, R = 10, T = 12, B = 34;
@@ -1269,7 +1276,7 @@ const ACTIONS = {
   sheetCsv: () => {
     const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const rows = [['Date', 'Batch', 'Rifle', 'Load', 'Bullet', 'Powder', 'Charge gr', 'Primer', 'Brass lot', 'Qty loaded', 'Fired', 'Left', 'Sizing', 'Annealed', 'Notes']];
-    [...S.batches].sort(byDate).forEach(b => { const l = get('loads', b.loadId) || {}; rows.push([b.date, b.no, (get('rifles', l.rifleId) || {}).name, nLoad(l), nBullet(get('bullets', l.bulletId)), nPowder(get('powders', l.powderId)), l.charge, nPrimer(get('primers', l.primerId)), (get('brass', b.brassId) || {}).name, b.qty, batchFired(b.id), batchLeft(b), b.sizing, b.annealed ? 'yes' : '', b.notes]); });
+    [...S.batches].sort(byDate).forEach(b => { const l = get('loads', b.loadId) || {}; rows.push([b.date, b.no, (get('rifles', l.rifleId) || {}).name, nLoad(l), nBullet(get('bullets', l.bulletId)), nPowder(get('powders', l.powderId)), l.charge, nPrimer(get('primers', l.primerId)), brassTitle(get('brass', b.brassId)), b.qty, batchFired(b.id), batchLeft(b), b.sizing, b.annealed ? 'yes' : '', b.notes]); });
     download(`reload-log-loading-${today()}.csv`, rows.map(r => r.map(q).join(',')).join('\n'), 'text/csv');
   }
 };
@@ -1288,6 +1295,7 @@ window.addEventListener('hashchange', () => { closeModal(); render(); });
 
 (async () => {
   await load();
+  numberBrass();
   sortAll();
   numberBatches();
   render();
