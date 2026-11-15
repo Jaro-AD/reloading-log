@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -216,6 +216,7 @@ function openForm(cfg) {
       case 'date': inp = `<input name="${fd.k}" type="date" value="${esc(val || today())}">`; break;
       case 'password': inp = `<input name="${fd.k}" type="password" autocomplete="off" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`; break;
       default: inp = `<input name="${fd.k}" type="text" value="${esc(val)}" placeholder="${esc(fd.ph || '')}">`;
+        if (fd.photo) inp = `<div class="row" style="flex-wrap:nowrap">${inp}<button type="button" class="btn sm" style="white-space:nowrap;flex:none" data-act="lotPhoto" data-k="${fd.k}" title="Photograph the lot number">📷 Lot</button></div>`;
     }
     return `<label class="${cls}"><span>${esc(fd.label)}${fd.type === 'len' ? ` (${unitLbl()})` : ''}${fd.req ? ' *' : ''}</span>${inp}${fd.help ? `<small>${esc(fd.help)}</small>` : ''}</label>`;
   };
@@ -303,7 +304,7 @@ function bulletForm(b, preset) {
       { k: 'weight', label: 'Weight (gr)', type: 'num', req: true },
       { k: 'diameter', label: 'Diameter / calibre', ph: '.308' },
       { k: 'bc', label: 'BC (G1/G7)', ph: 'G7 0.243' },
-      { k: 'lot', label: 'Lot number' },
+      { k: 'lot', label: 'Lot number', photo: true, full: true },
       { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true, help: 'Add to this number each time you buy more (or use Scan packet). Stock left is worked out from batches loaded.' },
       ...priceFields('bullets', 100),
       ...scanFields('Bullets per box, e.g. 100'),
@@ -319,7 +320,7 @@ function powderForm(p, preset) {
     fields: [
       { k: 'maker', label: 'Maker', req: true, ph: 'Somchem / Hodgdon' },
       { k: 'name', label: 'Powder', req: true, ph: 'S365 / Varget' },
-      { k: 'lot', label: 'Lot number', full: true, help: 'Add each new powder lot separately — burn rates vary between lots.' },
+      { k: 'lot', label: 'Lot number', photo: true, full: true, help: 'Add each new powder lot separately — burn rates vary between lots.' },
       { k: 'grams', label: 'Total bought (grams)', type: 'num', full: true, help: 'e.g. 1 kg tub = 1000. Add to it when you buy more of the same lot.' },
       ...priceFields('grams', 1000),
       ...scanFields('Grams per container, e.g. 1000'),
@@ -336,7 +337,7 @@ function primerForm(p, preset) {
       { k: 'maker', label: 'Maker', req: true, ph: 'CCI / PMP / Federal' },
       { k: 'name', label: 'Model', req: true, ph: 'BR2 / 210M' },
       { k: 'size', label: 'Type', type: 'select', options: PRIMER_SIZES },
-      { k: 'lot', label: 'Lot number' },
+      { k: 'lot', label: 'Lot number', photo: true, full: true },
       { k: 'qtyBought', label: 'Total bought (qty)', type: 'num', full: true },
       ...priceFields('primers', 100),
       ...scanFields('Primers per box, e.g. 1000'),
@@ -354,6 +355,7 @@ function brassForm(br, preset) {
       { k: 'name', label: 'Lot name', req: true, full: true, ph: 'e.g. Lapua 308 – Lot A' },
       { k: 'mark', label: 'Case marking / box label', full: true, ph: 'e.g. 1 red dot on head · box "308-A"', help: 'How you tell this lot apart physically — mark the case heads and label the box' },
       { k: 'headstamp', label: 'Headstamp / maker', ph: 'Lapua' },
+      { k: 'makerLot', label: "Maker's lot number", photo: true, full: true },
       { k: 'calibre', label: 'Calibre', ph: '.308 Win' },
       { k: 'count', label: 'Number of cases', type: 'num' },
       { k: 'rifleId', label: 'Fire-formed to rifle', type: 'select', options: opts('rifles', nRifle) },
@@ -656,7 +658,7 @@ function stockInForm(code, prod, extra) {
     values: { itemId: items.length ? items[items.length - 1].id : 'new', packs: 1, packQty: prod.packQty, ...(extra || {}) },
     fields: [
       { k: 'itemId', label: 'Add to', type: 'select', noBlank: true, full: true, options: [...items.map(i => [i.id, K.namer(i) + (prod.kind !== 'powder' && i.lot ? ' · lot ' + i.lot : '')]), ['new', '+ New lot / new entry']] },
-      { k: 'lot', label: 'Lot number on packet', full: true, help: 'For powder, a different lot always becomes a new entry' },
+      { k: 'lot', label: 'Lot number on packet', photo: true, full: true, help: 'For powder, a different lot always becomes a new entry' },
       { k: 'packs', label: 'Number of packs', type: 'num', req: true },
       { k: 'packQty', label: `Per pack (${K.unit})`, type: 'num', req: true },
       { k: 'packPrice', label: `Price per pack (${cur()})`, type: 'num', full: true, help: 'Optional — updates the price used for cost per round' },
@@ -741,7 +743,7 @@ function applyPhotoData(d, kindHint) {
   const kind = KINDS[d.kind] ? d.kind : kindHint;
   const q = num(d.quantity), unit = String(d.quantity_unit || '').toLowerCase();
   const code = String(d.barcode || '').replace(/\D/g, '');
-  const intro = `<div class="alert">Read from photo — <b>check every field</b> before saving.</div>`;
+  const intro = `<div class="alert">Read from photo — <b>check every field</b> before saving.${d.lot ? '' : ' No lot number found — tap <b>📷 Lot</b> to photograph it.'}</div>`;
   if (code && S.products[code] && KINDS[S.products[code].kind]) return stockInForm(code, S.products[code], d.lot ? { lot: d.lot } : null);
   if (!kind) {
     return openForm({
@@ -755,8 +757,46 @@ function applyPhotoData(d, kindHint) {
   if (kind === 'bullet') p = { ...base, weight: num(d.weight_gr), diameter: d.diameter || '', bc: d.bc || '', qtyBought: q, packQty: q };
   if (kind === 'primer') p = { ...base, size: PRIMER_SIZES.some(x => x[0] === d.primer_type) ? d.primer_type : '', qtyBought: q, packQty: q };
   if (kind === 'powder') { const g = q == null ? null : unit === 'kg' ? q * 1000 : unit === 'lb' ? Math.round(q * 453.59) : q; p = { ...base, grams: g, packQty: g }; }
-  if (kind === 'brass') p = { _intro: intro, barcode: code, headstamp: d.maker || '', calibre: d.calibre || '', count: q, packQty: q, name: `${d.maker || ''} ${d.calibre || ''} – Lot ${d.lot || 'A'}`.replace(/\s+/g, ' ').trim(), notes: d.lot ? 'Maker lot ' + d.lot : '' };
+  if (kind === 'brass') p = { _intro: intro, barcode: code, headstamp: d.maker || '', calibre: d.calibre || '', count: q, packQty: q, makerLot: d.lot || '', name: `${d.maker || ''} ${d.calibre || ''} – Lot A`.replace(/\s+/g, ' ').trim() };
   KINDS[kind].form(null, p);
+}
+async function callVision(file, prompt, maxTokens) {
+  const key = await kvGet('apikey');
+  if (!key) throw new Error('Add your Anthropic API key first (Setup → Photo reading).');
+  const data = await resizeImage(file);
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+    body: JSON.stringify({ model: S.settings.aiModel || 'claude-haiku-5-5', max_tokens: maxTokens, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }, { type: 'text', text: prompt }] }] })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(r.status === 401 ? 'API key not accepted — check it under Setup → Photo reading.' : (j.error && j.error.message) || 'Request failed (' + r.status + ')');
+  const txt = (j.content || []).map(c => c.text || '').join('');
+  const mt = txt.match(/\{[\s\S]*\}/); if (!mt) throw new Error('Could not read the photo. Try a sharper, closer shot.');
+  return JSON.parse(mt[0]);
+}
+const LOT_PROMPT = `This photo shows the lot / batch number printed or stamped on a reloading component packet (bullets, powder, primers or brass). Reply with ONLY JSON: {"lot":"the lot or batch number exactly as printed","date":"manufacture date if printed, else empty"}. If there is no clear lot number, use "". Do not guess.`;
+function lotPhoto(k) {
+  const form = $('#mform'); if (!form || !form.elements[k]) return;
+  const btn = form.querySelector(`[data-act="lotPhoto"][data-k="${k}"]`);
+  let inp = $('#lotfile');
+  if (!inp) { inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'; inp.setAttribute('capture', 'environment'); inp.id = 'lotfile'; inp.hidden = true; document.body.appendChild(inp); }
+  inp.onchange = async () => {
+    const f = inp.files[0]; inp.value = ''; if (!f) return;
+    const errEl = $('#ferr'); if (errEl) errEl.textContent = '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Reading…'; }
+    try {
+      const d = await callVision(f, LOT_PROMPT, 200);
+      const field = $('#mform') && $('#mform').elements[k]; if (!field) return;
+      if (!d.lot) throw new Error('No lot number found in that photo — try closer, with good light.');
+      field.value = String(d.lot).trim();
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+      field.style.outline = '2px solid var(--ok)'; setTimeout(() => field.style.outline = '', 1500);
+    } catch (e) {
+      const el = $('#ferr'); if (el) el.textContent = navigator.onLine === false ? 'No internet — photo reading needs signal.' : e.message;
+    } finally { if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '📷 Lot'; } }
+  };
+  inp.click();
 }
 function pickPhoto(kindHint) {
   let inp = $('#photofile');
@@ -914,7 +954,7 @@ const views = {
   brasslot(q, id) {
     const br = get('brass', id); if (!br) return empty('Brass lot not found.');
     const st = brassState(br);
-    return `<div class="card"><div class="ttl">${esc(br.name)}</div>${br.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(br.mark)}</div>` : ''}<div class="sub">${esc([br.headstamp, br.calibre, br.count ? br.count + ' cases' : ''].filter(Boolean).join(' · '))}</div>
+    return `<div class="card"><div class="ttl">${esc(br.name)}</div>${br.mark ? `<div class="sub" style="color:var(--acc)">Mark: ${esc(br.mark)}</div>` : ''}<div class="sub">${esc([br.headstamp, br.calibre, br.count ? br.count + ' cases' : '', br.makerLot ? 'maker lot ' + br.makerLot : ''].filter(Boolean).join(' · '))}</div>
       <div class="kv"><div>Times fired<b>${st.firings}</b></div><div>Neck sizes since FL<b>${st.neck}${st.flAfter != null ? ' / ' + st.flAfter : ''}</b></div><div>Firings since anneal<b>${st.anneal}${st.annealEvery ? ' / ' + st.annealEvery : ''}</b></div>
       <div>Retire at<b>${st.retireAt || '–'}</b></div><div>Last length<b>${fLen(st.lastLen)}</b></div><div>Max / trim-to<b>${fLen(br.maxLen)} / ${fLen(br.trimTo)}</b></div><div>Last trimmed<b>${esc(st.lastTrim || '–')}</b></div><div>Currently loaded<b>${st.loaded}</b></div></div>
       ${br.notes ? `<div class="note">${esc(br.notes)}</div>` : ''}</div>
@@ -1042,6 +1082,7 @@ const ACTIONS = {
   settings: () => settingsForm(),
   scan: d => openScanner(handleCode, d.kind),
   photo: d => pickPhoto(d.kind),
+  lotPhoto: d => lotPhoto(d.k),
   ai: () => aiForm(),
   export: () => download(`reload-log-backup-${today()}.json`, JSON.stringify({ ...S, exported: new Date().toISOString(), app: APP_VERSION }, null, 1), 'application/json'),
   import: () => $('#importfile').click(),
