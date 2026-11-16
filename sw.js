@@ -1,5 +1,5 @@
-const CACHE = 'reload-log-v1.11.0';
-const FILES = ['./', './index.html', './app.js', './styles.css', './manifest.json', './icon-192.png', './icon-512.png', './icon-180.png', './vendor/html5-qrcode.min.js'];
+const CACHE = 'reload-log-v1.12.0';
+const FILES = ['./', './index.html', './app.js', './config.js', './styles.css', './manifest.json', './icon-192.png', './icon-512.png', './icon-180.png', './vendor/html5-qrcode.min.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))); self.clients.claim(); });
 // Network first (so updates arrive), fall back to cache offline at the range.

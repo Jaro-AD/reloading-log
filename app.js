@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.11.0';
+const APP_VERSION = '1.12.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -101,6 +101,11 @@ function batchNo(b) {
 function numberBatches() { [...S.batches].sort(byDate).forEach(b => { if (!b.no) b.no = batchNo(b); }); }
 async function save() {
   sortAll();
+  stampChanges();
+  await saveLocal();
+  scheduleSync();
+}
+async function saveLocal() {
   const el = $('#savestate');
   try {
     const db = await idb();
@@ -111,6 +116,132 @@ async function save() {
     catch (_) { el.textContent = 'NOT SAVED'; alert('Could not save data on this device: ' + e.message); }
   }
   clearTimeout(save._t); save._t = setTimeout(() => el.textContent = '', 1500);
+}
+
+/* ---------- sync between devices (Supabase) ----------
+   Each record carries `updated`; deletions leave a tombstone in S._del. Devices merge record-by-record (newest wins),
+   so work done on the phone and the PC combines instead of overwriting. Sign-in is by a code emailed to you. */
+const CFG = window.RL_CONFIG || {};
+const sbReady = () => !!(CFG.supabaseUrl && CFG.supabaseKey);
+let _snap = new Map(), _syncing = false, _syncTimer = null, _sbSession = null;
+function snapInit() {
+  _snap = new Map();
+  COLS.forEach(c => S[c].forEach(x => { const { updated, ...r } = x; _snap.set(c + ':' + x.id, JSON.stringify(r)); }));
+  ['settings', 'products'].forEach(k => _snap.set(k, JSON.stringify(S[k])));
+}
+function stampChanges() {
+  const now = Date.now(), seen = new Set();
+  S._del = S._del || {}; S._ts = S._ts || {};
+  COLS.forEach(c => S[c].forEach(x => {
+    const key = c + ':' + x.id, { updated, ...r } = x, j = JSON.stringify(r); seen.add(key);
+    if (_snap.get(key) !== j) { x.updated = now; _snap.set(key, j); }
+  }));
+  [..._snap.keys()].forEach(k => { if (k.includes(':') && !seen.has(k)) { S._del[k] = now; _snap.delete(k); } });
+  ['settings', 'products'].forEach(k => { const j = JSON.stringify(S[k]); if (_snap.get(k) !== j) { S._ts[k] = now; _snap.set(k, j); } });
+}
+function mergeState(L, R) {
+  const out = normalise({ ...L });
+  const del = { ...(R._del || {}) };
+  Object.entries(L._del || {}).forEach(([k, t]) => { del[k] = Math.max(del[k] || 0, t); });
+  COLS.forEach(c => {
+    const m = new Map();
+    [...(R[c] || []), ...(L[c] || [])].forEach(x => { const o = m.get(x.id); if (!o || (x.updated || 0) >= (o.updated || 0)) m.set(x.id, x); });
+    out[c] = [...m.values()].filter(x => !((del[c + ':' + x.id] || 0) > (x.updated || 0)));
+  });
+  const lt = L._ts || {}, rt = R._ts || {};
+  out._ts = {};
+  ['settings', 'products'].forEach(k => { out[k] = (rt[k] || 0) > (lt[k] || 0) ? R[k] : L[k]; out._ts[k] = Math.max(lt[k] || 0, rt[k] || 0); });
+  out.settings = { ...blank().settings, ...(out.settings || {}) };
+  if (!out.products || typeof out.products !== 'object') out.products = {};
+  const cutoff = Date.now() - 180 * 864e5; // forget tombstones after 6 months
+  out._del = Object.fromEntries(Object.entries(del).filter(([, t]) => t > cutoff));
+  out.sessions.forEach(s => { if (!Array.isArray(s.strings)) s.strings = []; });
+  return out;
+}
+async function sbFetch(path, opts = {}, sess) {
+  const r = await fetch(CFG.supabaseUrl.replace(/\/$/, '') + path, {
+    ...opts, headers: { apikey: CFG.supabaseKey, 'content-type': 'application/json', ...(sess ? { authorization: 'Bearer ' + sess.access_token } : {}), ...(opts.headers || {}) }
+  });
+  const txt = await r.text(); let j = null; try { j = txt ? JSON.parse(txt) : null; } catch (_) {}
+  if (!r.ok) throw new Error((j && (j.msg || j.message || j.error_description || j.error)) || 'Sync request failed (' + r.status + ')');
+  return j;
+}
+async function sbSession() {
+  if (!_sbSession) _sbSession = await kvGet('sbsession');
+  if (!_sbSession) return null;
+  if ((_sbSession.expires_at || 0) - 60 < Date.now() / 1000) {
+    try {
+      const j = await sbFetch('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: JSON.stringify({ refresh_token: _sbSession.refresh_token }) });
+      await setSbSession(j);
+    } catch (e) { if (!navigator.onLine) return _sbSession; await setSbSession(null); return null; }
+  }
+  return _sbSession;
+}
+async function setSbSession(j) {
+  _sbSession = j ? { access_token: j.access_token, refresh_token: j.refresh_token, expires_at: j.expires_at || Math.floor(Date.now() / 1000) + (j.expires_in || 3600), user: { id: j.user.id, email: j.user.email } } : null;
+  await kvSet('sbsession', _sbSession);
+}
+function syncMsg(t) { const el = $('#savestate'); if (el) { el.textContent = t; clearTimeout(save._t); if (t && !/fail/i.test(t)) save._t = setTimeout(() => el.textContent = '', 2000); } }
+function scheduleSync(ms = 3000) { if (!sbReady()) return; clearTimeout(_syncTimer); _syncTimer = setTimeout(() => syncNow(false), ms); }
+async function syncNow(manual) {
+  if (!sbReady() || _syncing) return;
+  if (!navigator.onLine) { if (manual) alert('No internet — changes are saved on this device and will sync when you are back online.'); return; }
+  _syncing = true;
+  try {
+    const sess = await sbSession(); if (!sess) return;
+    syncMsg('Syncing…');
+    const rows = await sbFetch('/rest/v1/app_state?select=data&user_id=eq.' + sess.user.id, {}, sess);
+    const remote = rows && rows[0] && rows[0].data;
+    if (remote) {
+      stampChanges();
+      S = mergeState(S, remote); sortAll(); numberBatches();
+      await saveLocal(); snapInit();
+    }
+    await sbFetch('/rest/v1/app_state', { method: 'POST', headers: { prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ user_id: sess.user.id, data: S, updated_at: new Date().toISOString() }) }, sess);
+    await kvSet('lastsync', new Date().toISOString());
+    syncMsg('Synced');
+    if (remote && $('#modal').hidden) render();
+  } catch (e) {
+    syncMsg('Sync failed'); if (manual) alert('Sync failed: ' + e.message);
+  } finally { _syncing = false; }
+}
+async function syncForm() {
+  if (!sbReady()) return alert('Sync is not set up yet.');
+  const sess = await sbSession();
+  if (sess) {
+    const last = await kvGet('lastsync');
+    return openForm({
+      title: 'Sync between devices', saveLabel: 'Sync now',
+      intro: `<div class="card"><div class="ttl">Signed in</div><div class="sub">${esc(sess.user.email)} · last synced ${esc(last ? new Date(last).toLocaleString() : 'never')}</div><div class="sub" style="margin-top:6px">Changes sync automatically a few seconds after you save, and when you open the app.</div></div>
+        <div class="btns"><button type="button" class="btn danger" data-act="sbSignOut">Sign out on this device</button></div>`,
+      fields: [],
+      onSave: async () => { await syncNow(true); }
+    });
+  }
+  openForm({
+    title: 'Sync — sign in', saveLabel: 'Email me a code',
+    intro: `<div class="card sub">Sign in with the same email on your phone and PC. Data already on this device is merged with what's in the cloud — nothing is overwritten.</div>`,
+    fields: [{ k: 'email', label: 'Email address', full: true, req: true, ph: 'you@example.com' }],
+    onSave: async o => {
+      try { await sbFetch('/auth/v1/otp', { method: 'POST', body: JSON.stringify({ email: o.email, create_user: true }) }); }
+      catch (e) { return e.message; }
+      return { next: () => codeForm(o.email) };
+    }
+  });
+}
+function codeForm(email) {
+  openForm({
+    title: 'Enter the code', saveLabel: 'Sign in',
+    intro: `<div class="card sub">We emailed a code to <b>${esc(email)}</b>. Enter it here (check spam if it doesn't arrive within a minute).</div>`,
+    fields: [{ k: 'code', label: 'Code from the email', full: true, req: true, ph: '123456' }],
+    onSave: async o => {
+      try {
+        const j = await sbFetch('/auth/v1/verify', { method: 'POST', body: JSON.stringify({ type: 'email', email, token: o.code.replace(/\s/g, '') }) });
+        await setSbSession(j);
+      } catch (e) { return 'Code not accepted: ' + e.message; }
+      return { next: () => syncNow(true) };
+    }
+  });
 }
 
 /* ---------- units ----------
@@ -1250,9 +1381,10 @@ const views = {
       <h2>Equipment &amp; components</h2>
       ${it('#/rifles', 'Rifles', S.rifles.length)}${it('#/bullets', 'Bullets', S.bullets.length)}${it('#/powders', 'Powders', S.powders.length)}${it('#/primers', 'Primers', S.primers.length)}${it('#/brass', 'Brass lots', S.brass.length)}
       <h2>App</h2>
+      ${sbReady() ? `<div class="btns"><button class="btn pri" data-act="sync">⟳ Sync between devices</button></div>` : ''}
       <div class="btns"><button class="btn" data-act="settings">Settings, units &amp; brass rules</button><button class="btn" data-act="ai">Photo reading (AI key)</button></div>
       <h2>Backup</h2>
-      <div class="card sub">Your data is stored only on this device. Export a backup regularly (save it to OneDrive/Google Drive) — and use it to move data to another phone or PC.</div>
+      <div class="card sub">${sbReady() ? 'With sync switched on, your data is also kept in the cloud. A backup file is still a good extra copy.' : 'Your data is stored only on this device. Export a backup regularly (save it to OneDrive/Google Drive) — and use it to move data to another phone or PC.'}</div>
       <div class="btns"><button class="btn pri" data-act="export">Export backup</button><button class="btn" data-act="import">Import backup</button><button class="btn" data-act="csv">Export range data (CSV)</button></div>
       <input type="file" id="importfile" accept="application/json,.json" hidden>
       <div class="disclaimer">Reload Log v${APP_VERSION}. This app records your own data — it does not supply load data. Always use published load manuals, start low, and work up watching for pressure signs.</div>`;
@@ -1365,6 +1497,8 @@ const ACTIONS = {
   export: () => download(`reload-log-backup-${today()}.json`, JSON.stringify({ ...S, exported: new Date().toISOString(), app: APP_VERSION }, null, 1), 'application/json'),
   import: () => $('#importfile').click(),
   csv: () => csvExport(),
+  sync: () => syncForm(),
+  sbSignOut: async () => { await setSbSession(null); closeModal(); render(); },
   combine: async d => {
     const ids = d.ids.split(','), k = d.kind, items = ids.map(id => get(KIND_COL[k], id)).filter(Boolean);
     if (!confirm(`Combine ${items.length} entries of ${lotLabel(k, items[0])} into one? Stock, prices, recipes and batches are merged.`)) return;
@@ -1396,7 +1530,11 @@ window.addEventListener('hashchange', () => { closeModal(); render(); });
   numberBrass();
   sortAll();
   numberBatches();
+  snapInit();
   render();
+  syncNow(false);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncNow(false); });
+  window.addEventListener('online', () => syncNow(false));
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 })();
