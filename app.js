@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.12.0';
+const APP_VERSION = '1.13.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -219,29 +219,40 @@ async function syncForm() {
     });
   }
   openForm({
-    title: 'Sync — sign in', saveLabel: 'Email me a code',
-    intro: `<div class="card sub">Sign in with the same email on your phone and PC. Data already on this device is merged with what's in the cloud — nothing is overwritten.</div>`,
-    fields: [{ k: 'email', label: 'Email address', full: true, req: true, ph: 'you@example.com' }],
-    onSave: async o => {
-      try { await sbFetch('/auth/v1/otp', { method: 'POST', body: JSON.stringify({ email: o.email, create_user: true }) }); }
-      catch (e) { return e.message; }
-      return { next: () => codeForm(o.email) };
-    }
-  });
-}
-function codeForm(email) {
-  openForm({
-    title: 'Enter the code', saveLabel: 'Sign in',
-    intro: `<div class="card sub">We emailed a code to <b>${esc(email)}</b>. Enter it here (check spam if it doesn't arrive within a minute).</div>`,
-    fields: [{ k: 'code', label: 'Code from the email', full: true, req: true, ph: '123456' }],
+    title: 'Sync — sign in', saveLabel: 'Sign in',
+    intro: `<div class="card sub">Use the same email and password on your phone and PC. Data already on this device is merged with what's in the cloud — nothing is overwritten.</div>`,
+    fields: [
+      { k: 'email', label: 'Email address', full: true, req: true, ph: 'you@example.com' },
+      { k: 'password', label: 'Password', type: 'password', full: true, req: true, help: 'At least 8 characters' },
+      { k: 'isNew', label: 'This is my first time — create my sync account', type: 'check' }
+    ],
     onSave: async o => {
       try {
-        const j = await sbFetch('/auth/v1/verify', { method: 'POST', body: JSON.stringify({ type: 'email', email, token: o.code.replace(/\s/g, '') }) });
-        await setSbSession(j);
-      } catch (e) { return 'Code not accepted: ' + e.message; }
+        if (o.isNew) {
+          if (o.password.length < 8) return 'Use at least 8 characters.';
+          const j = await sbFetch('/auth/v1/signup', { method: 'POST', body: JSON.stringify({ email: o.email, password: o.password }) });
+          if (!j.access_token) return { next: () => alert('Account created. Open the email from Supabase and tap the confirmation link, then come back here and sign in with the same email and password.') };
+          await setSbSession(j);
+        } else {
+          const j = await sbFetch('/auth/v1/token?grant_type=password', { method: 'POST', body: JSON.stringify({ email: o.email, password: o.password }) });
+          await setSbSession(j);
+        }
+      } catch (e) { return /confirm/i.test(e.message) ? 'Email not confirmed yet — tap the link in the Supabase email first.' : /invalid/i.test(e.message) ? 'Email or password not accepted.' : e.message; }
       return { next: () => syncNow(true) };
     }
   });
+}
+/* The confirmation email link opens the app with the session in the address (#access_token=…). */
+async function handleAuthRedirect() {
+  if (!sbReady() || !/access_token=/.test(location.hash)) return;
+  const p = new URLSearchParams(location.hash.slice(1));
+  try {
+    const tok = { access_token: p.get('access_token'), refresh_token: p.get('refresh_token'), expires_in: +p.get('expires_in') || 3600 };
+    const user = await sbFetch('/auth/v1/user', {}, tok);
+    await setSbSession({ ...tok, user });
+    history.replaceState(null, '', location.pathname + '#/setup');
+    alert('Email confirmed — sync is on for this device.');
+  } catch (e) { history.replaceState(null, '', location.pathname + '#/home'); }
 }
 
 /* ---------- units ----------
@@ -1531,6 +1542,7 @@ window.addEventListener('hashchange', () => { closeModal(); render(); });
   sortAll();
   numberBatches();
   snapInit();
+  await handleAuthRedirect();
   render();
   syncNow(false);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncNow(false); });
