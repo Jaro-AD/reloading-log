@@ -76,3 +76,11 @@ select:focus,input:focus,textarea:focus{outline:2px solid var(--acc);outline-off
 .disclaimer{font-size:12px;color:var(--mut);margin-top:16px;line-height:1.5}
 .reader{width:100%;min-height:220px;background:#000;border-radius:var(--r);overflow:hidden}
 .reader video{width:100%!important;height:auto!important;display:block}
+.fbar{margin-bottom:10px}
+.fbar input{margin-bottom:8px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+.chips .sub{min-width:56px}
+.chip{font:inherit;font-size:13px;padding:5px 11px;border-radius:99px;background:var(--card2);color:var(--tx);border:1px solid var(--line);cursor:pointer}
+.chip.on{background:var(--acc);color:#14171a;border-color:var(--acc);font-weight:600}
+.fitem[hidden]{display:none}
+.fbar a{color:var(--acc)}

@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.13.0';
+const APP_VERSION = '1.14.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -440,13 +440,56 @@ function combineLots(kind, ids) {
   S.batches.forEach(b => { if (restIds.includes(b[kind + 'Lot'])) b[kind + 'Lot'] = keep.id; });
   S[col] = S[col].filter(x => !restIds.includes(x.id));
 }
+/* ---------- component search & group filter ---------- */
+// Calibre group from a free-text diameter: ".375", "0.375", "375 H&H" → ".375"; "7mm" stays "7mm".
+function calGroup(d) {
+  const t = String(d || '').trim(); if (!t) return '';
+  const m = t.match(/\d*\.?\d+/); if (!m) return t;
+  const n = +m[0];
+  if (n > 0 && n < 1) return '.' + String(+n.toFixed(3)).split('.')[1];
+  if (n >= 100 && n < 1000 && !/mm/i.test(t)) return '.' + Math.round(n);
+  return t;
+}
+const FILTER_GROUPS = {
+  bullet: [['Calibre', b => calGroup(b.diameter)], ['Maker', b => (b.maker || '').trim()], ['Weight', b => b.weight != null && b.weight !== '' ? b.weight + 'gr' : '']],
+  powder: [['Maker', p => (p.maker || '').trim()], ['Powder', p => (p.name || '').trim()]],
+  primer: [['Type', p => p.size || ''], ['Maker', p => (p.maker || '').trim()]]
+};
+const compFilter = kind => (query.cf = query.cf || {})[kind] = query.cf[kind] || { q: '', g: {} };
+function compSearchText(kind, x) {
+  const extra = FILTER_GROUPS[kind].map(([, f]) => f(x));
+  return [x.maker, x.name, x.weight != null ? x.weight + 'gr' : '', x.diameter, x.bc, x.size, x.lot, x.notes, x.barcode, ...extra].filter(Boolean).join(' ').toLowerCase();
+}
+function compFilterBar(kind, items) {
+  const f = compFilter(kind);
+  const rows = FILTER_GROUPS[kind].map(([grp, fn]) => {
+    const vals = [...new Set(items.map(fn).filter(Boolean))].sort((a, b) => (parseFloat(a.replace(/^\./, '0.')) - parseFloat(b.replace(/^\./, '0.'))) || a.localeCompare(b));
+    if (vals.length < 2 && !f.g[grp]) return '';
+    return `<div class="chips"><span class="sub">${grp}</span>${vals.map(v => `<button type="button" class="chip${f.g[grp] === v ? ' on' : ''}" data-act="fchip" data-kind="${kind}" data-grp="${esc(grp)}" data-val="${esc(v)}">${esc(v)}</button>`).join('')}</div>`;
+  }).join('');
+  return `<div class="fbar"><input type="search" data-csearch="${kind}" value="${esc(f.q)}" placeholder="Search e.g. sierra 375 300gr" autocomplete="off">${rows}<div class="sub" id="fcount-${kind}"></div></div>`;
+}
+function applyCompFilter(kind) {
+  const f = compFilter(kind);
+  const toks = f.q.toLowerCase().split(/\s+/).filter(Boolean);
+  let shown = 0, total = 0;
+  document.querySelectorAll(`.fitem[data-kind="${kind}"]`).forEach(el => {
+    total++;
+    const g = JSON.parse(el.dataset.g || '{}');
+    const ok = toks.every(t => el.dataset.s.includes(t)) && Object.entries(f.g).every(([k, v]) => !v || g[k] === v);
+    el.hidden = !ok; if (ok) shown++;
+  });
+  const c = document.getElementById('fcount-' + kind);
+  if (c) c.innerHTML = toks.length || Object.values(f.g).some(Boolean) ? `Showing ${shown} of ${total} · <a href="#" data-act="fclear" data-kind="${kind}">Clear filter</a>` : '';
+}
+
 function compListView(kind, act, newAct, sub, unit) {
   const col = KIND_COL[kind], qk = QTY_KEY[kind];
   const live = S[col].filter(x => !isFinished(x)), done = S[col].filter(isFinished);
   const dups = dupGroups(kind).map(g => `<div class="alert">${g.length} entries are the same product and lot <b>${esc(lotLabel(kind, g[0]))}</b>. <button class="btn sm" data-act="combine" data-kind="${kind}" data-ids="${g.map(x => x.id).join(',')}">Combine</button></div>`).join('');
-  const cardFor = x => stockCard(act, x.id, lotLabel(kind, x), [...sub(x), packInfo(kind, x)], compLeft(kind, x), +x[qk] || 0, unit, statusPillFor(x));
+  const cardFor = x => `<div class="fitem" data-kind="${kind}" data-s="${esc(compSearchText(kind, x))}" data-g="${esc(JSON.stringify(Object.fromEntries(FILTER_GROUPS[kind].map(([g, fn]) => [g, fn(x)]))))}">${stockCard(act, x.id, lotLabel(kind, x), [...sub(x), packInfo(kind, x)], compLeft(kind, x), +x[qk] || 0, unit, statusPillFor(x))}</div>`;
   return `<div class="btns"><button class="btn pri" data-act="${newAct}">+ New</button><button class="btn" data-act="scan" data-kind="${kind}">▦ Scan</button><button class="btn" data-act="photo" data-kind="${kind}">📷 Photo</button></div>
-    ${dups}${live.map(cardFor).join('') || empty('Nothing in stock.')}
+    ${S[col].length > 1 ? compFilterBar(kind, S[col]) : ''}${dups}${live.map(cardFor).join('') || empty('Nothing in stock.')}
     ${done.length ? `<details class="card"><summary class="sub" style="cursor:pointer">Finished (${done.length}) — kept for history</summary>${done.map(cardFor).join('')}</details>` : ''}`;
 }
 
@@ -1483,9 +1526,12 @@ function render() {
   document.querySelectorAll('.tabs a').forEach(a => a.classList.toggle('on', a.dataset.tab === tab));
   const y = render._last === location.hash ? window.scrollY : 0;
   $('#view').innerHTML = views[name](query, id);
+  const ck = { bullets: 'bullet', powders: 'powder', primers: 'primer' }[name]; if (ck) applyCompFilter(ck);
   window.scrollTo(0, y); render._last = location.hash;
 }
 const ACTIONS = {
+  fchip: d => { const f = compFilter(d.kind); f.g[d.grp] = f.g[d.grp] === d.val ? '' : d.val; document.querySelectorAll(`.chip[data-kind="${d.kind}"][data-grp="${d.grp}"]`).forEach(c => c.classList.toggle('on', f.g[d.grp] === c.dataset.val)); applyCompFilter(d.kind); },
+  fclear: d => { query.cf[d.kind] = { q: '', g: {} }; render(); },
   newBatch: d => batchForm(null, { loadId: d.load || undefined, brassId: d.brass || undefined, rifleId: d.rifle || undefined }),
   editBatch: d => batchForm(get('batches', d.id)),
   velTests: d => velTestsForm(get('loads', d.id)),
@@ -1531,6 +1577,7 @@ document.addEventListener('change', e => {
   if (e.target.id === 'importfile' && e.target.files[0]) { importFile(e.target.files[0]); e.target.value = ''; }
   if (e.target.dataset.filter) { query[e.target.dataset.filter] = e.target.value; render(); }
 });
+document.addEventListener('input', e => { const k = e.target.dataset && e.target.dataset.csearch; if (k) { compFilter(k).q = e.target.value; applyCompFilter(k); } });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 $('#back').onclick = () => history.length > 1 ? history.back() : (location.hash = '#/home');
 window.addEventListener('hashchange', () => { closeModal(); render(); });
