@@ -1,7 +1,7 @@
 'use strict';
 /* Reload Log — reloading + range data, all stored on this device (IndexedDB). */
 
-const APP_VERSION = '1.14.0';
+const APP_VERSION = '1.15.0';
 const GR_TO_G = 0.06479891;
 const MOA_MM_PER_100M = 29.0888;
 const COLS = ['rifles', 'bullets', 'powders', 'primers', 'brass', 'loads', 'batches', 'sessions'];
@@ -319,15 +319,16 @@ function batchFired(batchId, exceptStringId) {
   S.sessions.forEach(s => s.strings.forEach(st => { if (st.batchId === batchId && st.id !== exceptStringId) n += +st.shots || 0; }));
   return n;
 }
-const batchLeft = b => (+b.qty || 0) - batchFired(b.id);
+const batchLeft = b => b.historic ? 0 : (+b.qty || 0) - batchFired(b.id);
 function rifleRounds(r) {
   let n = +r.initRounds || 0;
-  S.sessions.forEach(s => { if (s.rifleId === r.id) s.strings.forEach(st => n += +st.shots || 0); });
+  S.sessions.forEach(s => { if (s.rifleId === r.id && !s.historic) s.strings.forEach(st => n += +st.shots || 0); });
   return n;
 }
 function stockUsed(kind, id) {
   let used = 0;
   S.batches.forEach(b => {
+    if (b.historic) return; // notebook history never used current stock
     const l = get('loads', b.loadId); if (!l) return;
     const q = +b.qty || 0;
     if (kind === 'bullet' && (b.bulletLot || l.bulletId) === id) used += q;
@@ -497,7 +498,7 @@ function rule(br, k) { return br[k] != null && br[k] !== '' ? +br[k] : (S.settin
 
 /* Brass life cycle — counted from the batches loaded with this lot. Each loading = one firing. */
 function brassState(br) {
-  const hist = S.batches.filter(b => b.brassId === br.id).sort(byDate);
+  const hist = S.batches.filter(b => b.brassId === br.id && !b.historic).sort(byDate);
   let firings = +br.initFirings || 0, neck = +br.initNeck || 0, anneal = +br.initAnneal || 0;
   let lastLen = br.lastLen ?? null, lastTrim = null;
   // Batches from the same lot on the same date = one loading cycle (e.g. a ladder test split across steps).
@@ -1069,13 +1070,14 @@ async function kvSet(k, v) { try { const db = await idb(); await new Promise((re
 async function aiForm() {
   const key = await kvGet('apikey');
   openForm({
-    title: 'Photo reading (AI)', values: { key: key || '', model: S.settings.aiModel || 'claude-haiku-5-5' },
+    title: 'Photo reading (AI)', values: { key: key || '', model: S.settings.aiModel || 'claude-haiku-5-5', modelNotes: S.settings.aiModelNotes || 'claude-sonnet-5-5' },
     intro: `<div class="card sub">Reads packet labels from a photo using your own Anthropic API key. The key is stored <b>only on this device</b> — not on GitHub and not in backups. Set a monthly spend limit in the Anthropic console. Needs signal.</div>`,
     fields: [
       { k: 'key', label: 'Anthropic API key', type: 'password', full: true, ph: 'sk-ant-…' },
-      { k: 'model', label: 'Model', full: true, help: 'Default claude-haiku-5-5 (fast, cheapest). Try claude-sonnet-5-5 if labels are hard to read.' }
+      { k: 'model', label: 'Model', full: true, help: 'Default claude-haiku-5-5 (fast, cheapest). Try claude-sonnet-5-5 if labels are hard to read.' },
+      { k: 'modelNotes', label: 'Model for handwritten notebooks', full: true, help: 'Default claude-sonnet-5-5 — handwriting needs the stronger model. Try claude-opus-5-5 for very hard pages.' }
     ],
-    onSave: async o => { await kvSet('apikey', o.key || ''); S.settings.aiModel = o.model || 'claude-haiku-5-5'; }
+    onSave: async o => { await kvSet('apikey', o.key || ''); S.settings.aiModel = o.model || 'claude-haiku-5-5'; S.settings.aiModelNotes = o.modelNotes || 'claude-sonnet-5-5'; }
   });
 }
 function resizeImage(file, max = 1568) {
@@ -1142,14 +1144,14 @@ function applyPhotoData(d, kindHint) {
   if (kind === 'brass') p = { _intro: intro, barcode: code, headstamp: d.maker || '', calibre: d.calibre || '', count: q, packQty: q, makerLot: d.lot || '' };
   KINDS[kind].form(null, p);
 }
-async function callVision(file, prompt, maxTokens) {
+async function callVision(file, prompt, maxTokens, model, maxPx) {
   const key = await kvGet('apikey');
   if (!key) throw new Error('Add your Anthropic API key first (Setup → Photo reading).');
-  const data = await resizeImage(file);
+  const data = await resizeImage(file, maxPx || 1568);
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-    body: JSON.stringify({ model: S.settings.aiModel || 'claude-haiku-5-5', max_tokens: maxTokens, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }, { type: 'text', text: prompt }] }] })
+    body: JSON.stringify({ model: model || S.settings.aiModel || 'claude-haiku-5-5', max_tokens: maxTokens, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }, { type: 'text', text: prompt }] }] })
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(r.status === 401 ? 'API key not accepted — check it under Setup → Photo reading.' : (j.error && j.error.message) || 'Request failed (' + r.status + ')');
@@ -1179,6 +1181,154 @@ function lotPhoto(k) {
     } finally { if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '📷 Lot'; } }
   };
   inp.click();
+}
+/* ---------- notebook import: photos of handwritten load data → loads, history batches, range strings ---------- */
+// Imported batches are history: they never use current stock, brass firings or rifle round count, and are never "ready to shoot".
+const NOTE_PROMPT = `This is a photo of a page from a handwritten reloading notebook (load data and/or load development / range results). Transcribe it into structured data.
+Reply with ONLY a JSON object, no other text:
+{"rifle":"rifle name if written","calibre":"e.g. .375 H&H","series":"heading/title of the test if any","entries":[{
+"date":"YYYY-MM-DD (dates are South African style, day first: 05/03/19 = 2019-03-05) or ''",
+"bullet":{"maker":"","name":"model e.g. GameKing","weight_gr":null,"diameter":"e.g. .375"},
+"powder":{"maker":"e.g. Somchem / Hodgdon","name":"e.g. S365 / Varget","lot":""},
+"primer":{"maker":"","name":"e.g. 210M / BR2","size":"Small Rifle|Small Rifle Magnum|Large Rifle|Large Rifle Magnum|Small Pistol|Large Pistol|''"},
+"brass":"brass headstamp/notes if written",
+"charge_gr":null,"coal":null,"cbto":null,"len_unit":"in|mm",
+"rounds":null,"velocities":[],"avg_vel":null,"es":null,"sd":null,"vel_unit":"fps|ms",
+"group":null,"group_unit":"mm|in|moa","distance":null,"distance_unit":"m|yd","temp_c":null,
+"verdict":"best|good|pressure|rejected|''","notes":"anything else written for this line (pressure signs, comments)"}],
+"unreadable":"anything you could not read"}
+Rules: one entry per load line / charge step / group. If the bullet, powder, primer, date or distance is written once for the page, repeat it in every entry. Copy numbers exactly as written; use null when not written. Never invent or "correct" values. Velocities: list each shot only if individual shots are written. If the unit is not written, guess from the size of the numbers (velocities over 1300 are fps; COAL around 2-4 is inches).`;
+const KIND_LABEL = { bullet: 'Bullet', powder: 'Powder', primer: 'Primer' };
+const descOf = (kind, c) => !c ? '' : (kind === 'bullet' ? [c.maker, c.weight_gr ? c.weight_gr + 'gr' : '', c.name, c.diameter] : kind === 'powder' ? [c.maker, c.name] : [c.maker, c.name, c.size]).filter(Boolean).join(' ').trim();
+function bestMatch(kind, c) {
+  const toks = low(descOf(kind, c)).split(/[\s,]+/).filter(Boolean); if (!toks.length) return '';
+  const seen = new Set(); let best = '', bs = 0;
+  S[KIND_COL[kind]].forEach(x => {
+    const k = pkey(kind, x); if (seen.has(k)) return; seen.add(k);
+    const txt = low([x.maker, x.name, x.weight != null ? x.weight + 'gr' : '', x.diameter, calGroup && kind === 'bullet' ? calGroup(x.diameter) : '', x.size].join(' '));
+    let s = toks.filter(t => txt.includes(t) || (kind === 'bullet' && calGroup(t) && txt.includes(calGroup(t)))).length / toks.length;
+    if (kind === 'bullet' && c.weight_gr && +x.weight !== +c.weight_gr) s -= 0.5;
+    if (s > bs) { bs = s; best = x.id; }
+  });
+  return bs >= 0.6 ? best : '';
+}
+function pickNotebook() {
+  let inp = $('#notefile');
+  if (!inp) { inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'; inp.multiple = true; inp.id = 'notefile'; inp.hidden = true; document.body.appendChild(inp); }
+  inp.onchange = () => { const fs = [...inp.files]; inp.value = ''; if (fs.length) readNotebook(fs); };
+  inp.click();
+}
+async function readNotebook(files) {
+  const m = $('#modal');
+  const show = t => { m.innerHTML = `<div class="sheet"><div class="sheet-h"><h3>Reading notebook</h3><button type="button" data-close>✕</button></div><div class="card sub">${t}</div></div>`; m.hidden = false; };
+  const pages = [];
+  try {
+    for (let i = 0; i < files.length; i++) {
+      show(`Reading page ${i + 1} of ${files.length}… handwriting takes 10–30 seconds a page.`);
+      const d = await callVision(files[i], NOTE_PROMPT, 6000, S.settings.aiModelNotes || 'claude-sonnet-5-5', 2000);
+      pages.push(d);
+    }
+  } catch (e) {
+    show(`<div class="alert bad">${esc(navigator.onLine === false ? 'No internet connection — reading needs signal.' : e.message)}</div>${pages.length ? `Read ${pages.length} page(s) before the error.` : ''}`);
+    if (!pages.length) return;
+  }
+  const entries = pages.flatMap(p => (p.entries || []).map(e => ({ ...e, _page: p })));
+  if (!entries.length) return show('<div class="alert bad">No load lines found on that page. Try a straight, well-lit photo of one page.</div>');
+  notebookReview(pages, entries);
+}
+function notebookReview(pages, entries) {
+  const p0 = pages[0] || {};
+  const unread = pages.map(p => p.unreadable).filter(Boolean).join(' · ');
+  // distinct components across all entries
+  const comps = {};
+  ['bullet', 'powder', 'primer'].forEach(k => {
+    comps[k] = [];
+    entries.forEach(e => { const d = descOf(k, e[k]); let i = comps[k].findIndex(c => low(c.desc) === low(d)); if (i < 0) { i = comps[k].length; comps[k].push({ desc: d, src: e[k] || {} }); } e['_' + k] = i; });
+  });
+  const lenTo = (v, u) => v == null ? null : u === 'mm' || v > 10 ? +v : +v * 25.4;
+  const velText = e => (e.velocities || []).map(v => toU('vel', fromU('vel', +v, e.vel_unit === 'ms' || (e.vel_unit !== 'fps' && +v < 1300) ? 'ms' : 'fps'))).map(v => Math.round(v)).join(' ');
+  const velBase = (v, e) => v == null ? null : fromU('vel', +v, e.vel_unit === 'ms' || (e.vel_unit !== 'fps' && +v < 1300) ? 'ms' : 'fps');
+  const distM = e => e.distance == null ? null : e.distance_unit === 'yd' ? e.distance * 0.9144 : +e.distance;
+  const groupMm = e => { if (e.group == null) return null; if (e.group_unit === 'moa') { const d = distM(e) || S.settings.distance || 100; return e.group * d / 100 * MOA_MM_PER_100M; } return e.group_unit === 'in' ? e.group * 25.4 : +e.group; };
+  const rifleMatch = S.rifles.find(r => p0.rifle && low(r.name).includes(low(p0.rifle))) || S.rifles.find(r => p0.calibre && calGroup(r.calibre) && calGroup(r.calibre) === calGroup(p0.calibre));
+  const values = { rifleId: rifleMatch ? rifleMatch.id : (S.rifles.length ? S.rifles[0].id : 'new'), newRifle: p0.rifle || '', newCal: p0.calibre || '', series: p0.series || 'Notebook ' + today(), source: 'Notebook', status: 'dev', distance: distM(entries.find(e => e.distance) || {}) || S.settings.distance };
+  const fields = [
+    { type: 'section', label: 'Rifle' },
+    { k: 'rifleId', label: 'Rifle', type: 'select', noBlank: true, full: true, options: [...opts('rifles', nRifle), ['new', '+ New rifle']] },
+    { k: 'newRifle', label: 'New rifle name', ph: 'only if + New rifle' }, { k: 'newCal', label: 'New rifle calibre' }
+  ];
+  ['bullet', 'powder', 'primer'].forEach(k => {
+    fields.push({ type: 'section', label: KIND_LABEL[k] + (comps[k].length > 1 ? 's' : '') + ' on the page' });
+    comps[k].forEach((c, i) => {
+      const fk = `c_${k}_${i}`; values[fk] = bestMatch(k, c.src) || 'new';
+      fields.push({ k: fk, label: `"${c.desc || '(not written)'}"`, type: 'select', noBlank: true, full: true, options: [...prodOpts(k), ['new', `+ Add "${c.desc || 'unknown'}" (history only, no stock)`]] });
+    });
+  });
+  fields.push({ type: 'section', label: 'For all lines' },
+    { k: 'series', label: 'Test series name', full: true, help: 'Groups the lines so you can compare them (Loads → Test series)' },
+    { k: 'source', label: 'Data source', ph: 'Notebook 2, p.14' },
+    { k: 'status', label: 'Status', type: 'select', options: STATUS, noBlank: true },
+    { k: 'distance', label: 'Distance (if not per line)', type: 'u', dim: 'dist' });
+  entries.forEach((e, i) => {
+    const n = i + 1, vt = velText(e);
+    Object.assign(values, { [`e${n}_on`]: true, [`e${n}_date`]: e.date || '', [`e${n}_charge`]: e.charge_gr, [`e${n}_coal`]: lenTo(e.coal, e.len_unit), [`e${n}_cbto`]: lenTo(e.cbto, e.len_unit),
+      [`e${n}_shots`]: e.rounds ?? ((e.velocities || []).length || null), [`e${n}_vels`]: vt, [`e${n}_avg`]: vt ? null : velBase(e.avg_vel, e), [`e${n}_group`]: groupMm(e), [`e${n}_dist`]: distM(e),
+      [`e${n}_proven`]: e.verdict === 'best', [`e${n}_notes`]: [e.notes, e.es != null ? 'ES ' + e.es : '', e.sd != null ? 'SD ' + e.sd : '', e.brass ? 'Brass: ' + e.brass : '', e.verdict === 'pressure' ? 'Pressure signs' : ''].filter(Boolean).join(' · ') });
+    fields.push({ type: 'section', label: `Line ${n}${e.charge_gr != null ? ' — ' + e.charge_gr + ' gr' : ''}${comps.bullet.length > 1 ? ' · ' + comps.bullet[e._bullet].desc : ''}${comps.powder.length > 1 ? ' · ' + comps.powder[e._powder].desc : ''}` },
+      { k: `e${n}_on`, label: 'Import this line', type: 'check' },
+      { k: `e${n}_date`, label: 'Date', type: 'date', noDefault: true }, { k: `e${n}_charge`, label: 'Charge (gr)', type: 'num' },
+      { k: `e${n}_coal`, label: 'COAL', type: 'len' }, { k: `e${n}_cbto`, label: 'CBTO', type: 'len' },
+      { k: `e${n}_shots`, label: 'Shots / rounds', type: 'num' }, { k: `e${n}_group`, label: 'Group', type: 'u', dim: 'group' },
+      { k: `e${n}_vels`, label: `Velocities (${uLbl('vel')}), each shot`, full: true }, { k: `e${n}_avg`, label: 'Average speed (if no shots listed)', type: 'u', dim: 'vel' },
+      { k: `e${n}_dist`, label: 'Distance', type: 'u', dim: 'dist' }, { k: `e${n}_proven`, label: 'Proven / best load', type: 'check' },
+      { k: `e${n}_notes`, label: 'Notes', full: true });
+  });
+  openForm({
+    title: `Notebook import — ${entries.length} line(s)`, values, fields, saveLabel: 'Import',
+    intro: `<div class="alert">Read from your handwriting — <b>check every number</b> against the book before importing.${unread ? ` Couldn't read: <i>${esc(unread)}</i>` : ''}</div><div class="card sub">Imported lines become load recipes, plus history batches and range results where results were written. History never uses your current stock, brass firings or rifle round count.</div>`,
+    onSave: o => {
+      const on = entries.map((e, i) => i + 1).filter(n => o[`e${n}_on`]);
+      if (!on.length) return 'Tick at least one line to import.';
+      for (const n of on) if (!(o[`e${n}_charge`] > 0)) return `Line ${n}: enter the charge.`;
+      let rifleId = o.rifleId;
+      if (rifleId === 'new') { if (!o.newRifle) return 'Enter the new rifle name.'; rifleId = upsert('rifles', null, { name: o.newRifle, calibre: o.newCal }).id; }
+      const compId = {};
+      ['bullet', 'powder', 'primer'].forEach(k => comps[k].forEach((c, i) => {
+        let id = o[`c_${k}_${i}`];
+        if (id === 'new') {
+          const s = c.src || {};
+          const base = { maker: s.maker || '', name: s.name || (c.desc || 'Unknown'), status: 'finished', historic: true, notes: 'Added from notebook import' };
+          const x = k === 'bullet' ? { ...base, weight: num(s.weight_gr), diameter: s.diameter || '', qtyBought: 0 } : k === 'powder' ? { ...base, lot: s.lot || '', grams: 0 } : { ...base, size: s.size || '', qtyBought: 0 };
+          id = upsert(KIND_COL[k], null, x).id;
+        }
+        compId[k + i] = id;
+      }));
+      const lens = on.map(n => o[`e${n}_charge`]);
+      const vary = new Set(lens).size === 1 && new Set(on.map(n => o[`e${n}_cbto`])).size > 1 ? 'cbto' : 'charge';
+      const sessions = {}; let made = 0, shot = 0;
+      on.forEach((n, j) => {
+        const e = entries[n - 1], g = k => compId[k + e['_' + k]];
+        const L = { rifleId, bulletId: g('bullet'), powderId: g('powder'), primerId: g('primer'), charge: o[`e${n}_charge`], coal: o[`e${n}_coal`], cbto: o[`e${n}_cbto`] };
+        const same = (a, b) => (a == null && b == null) || (a != null && b != null && Math.abs(a - b) < 0.01);
+        let l = S.loads.find(x => x.rifleId === L.rifleId && x.bulletId === L.bulletId && x.powderId === L.powderId && x.primerId === L.primerId && same(x.charge, L.charge) && same(x.cbto, L.cbto) && same(x.coal, L.coal));
+        if (!l) { l = upsert('loads', null, { ...L, source: o.source, status: o[`e${n}_proven`] ? 'proven' : o.status, series: on.length > 1 ? o.series : '', seriesVar: vary, seriesStep: j + 1, notes: o[`e${n}_notes`] || '', imported: true }); made++; }
+        else if (o[`e${n}_proven`]) l.status = 'proven';
+        const vels = String(o[`e${n}_vels`] || '').trim(), nv = parseVels(vels).length, shots = o[`e${n}_shots`] || nv || 0, grp = o[`e${n}_group`];
+        const avgBase = nv ? fromU('vel', stats(parseVels(vels)).avg, uCur('vel')) : o[`e${n}_avg`];
+        const date = o[`e${n}_date`] || '';
+        if (avgBase && testsOf(l).length < TEST_SLOTS) l.tests = [...testsOf(l), { date, season: date ? seasonOf(date) : '', vel: avgBase, ...(entries[n - 1].temp_c != null ? { airTemp: +entries[n - 1].temp_c } : {}) }];
+        if (!(shots || grp || nv || avgBase)) return;
+        const b = upsert('batches', null, { historic: true, date, qty: shots, loadId: l.id, brassId: '', sizing: 'none', notes: 'From notebook' + (o.source && o.source !== 'Notebook' ? ' — ' + o.source : '') });
+        b.no = batchNo(b);
+        if (!(nv || grp)) return;
+        const dist = o[`e${n}_dist`] || o.distance || S.settings.distance, key = [date, dist].join('|');
+        const s = sessions[key] || (sessions[key] = upsert('sessions', null, { date, rifleId, distance: dist, location: 'Notebook', historic: true, strings: [] }));
+        s.strings.push({ id: uid(), created: Date.now(), batchId: b.id, vels, velUnit: uCur('vel'), shots, groupMm: grp, pressureSigns: /pressure/i.test(o[`e${n}_notes`] || ''), notes: o[`e${n}_notes`] || '' });
+        shot++;
+      });
+      return { go: on.length > 1 && o.series ? '#/series/' + encodeURIComponent(o.series) : '#/loads', next: () => setTimeout(() => alert(`Imported ${on.length} line(s): ${made} new load recipe(s), ${shot} range result(s).`), 50) };
+    }
+  });
 }
 function pickPhoto(kindHint) {
   let inp = $('#photofile');
@@ -1310,7 +1460,7 @@ const views = {
     const list = S.loads.filter(l => !rf || l.rifleId === rf);
     const series = [...new Set(list.map(l => l.series).filter(Boolean))].sort(nat);
     const grp = k => list.filter(l => (l.status || 'dev') === k).sort(SORTS.loads);
-    return `<div class="btns"><button class="btn pri" data-act="newLoad">+ New load</button><button class="btn" data-act="ladder">Ladder planner</button></div>
+    return `<div class="btns"><button class="btn pri" data-act="newLoad">+ New load</button><button class="btn" data-act="ladder">Ladder planner</button><button class="btn" data-act="notebook">📖 Import notebook</button></div>
       ${S.rifles.length > 1 ? `<select class="filter" data-filter="rifle"><option value="">All rifles</option>${S.rifles.map(r => `<option value="${r.id}"${r.id === rf ? ' selected' : ''}>${esc(nRifle(r))}</option>`).join('')}</select>` : ''}
       ${series.length ? `<h2>Test series</h2>${series.map(t => card('#/series/' + encodeURIComponent(t), `<div class="row"><div class="grow ttl">${esc(t)}</div><span class="sub">${list.filter(l => l.series === t).length} loads ›</span></div>`)).join('')}` : ''}
       ${STATUS.map(([k, lbl]) => { const g = grp(k); return g.length ? `<h2>${lbl}</h2>${g.map(loadCard).join('')}` : ''; }).join('') || empty('No load recipes yet.')}`;
@@ -1384,7 +1534,7 @@ const views = {
     const b = get('batches', id); if (!b) return empty('Batch not found.');
     const l = get('loads', b.loadId);
     const strs = allStrings().filter(s => s.batchId === b.id);
-    return `<div class="card"><div class="ttl">${esc(nLoad(l))}</div><div class="sub">Batch <b>${esc(b.no || '–')}</b> · loaded ${esc(b.date)}</div>
+    return `<div class="card"><div class="ttl">${esc(nLoad(l))}</div><div class="sub">Batch <b>${esc(b.no || '–')}</b> · loaded ${esc(b.date)}</div>${b.historic ? '<div class="alert">📖 Imported from your notebook — history only (no stock, brass or round count used).</div>' : ''}
       <div class="kv"><div>Loaded<b>${b.qty}</b></div><div>Fired<b>${batchFired(b.id)}</b></div><div>Left<b>${batchLeft(b)}</b></div>
       <div>Brass lot<b>${esc(nBrass(get('brass', b.brassId)))}</b></div><div>Sizing<b>${esc((SIZING.find(s => s[0] === b.sizing) || [, '–'])[1])}</b></div>
       <div>Annealed<b>${b.annealed ? 'Yes' : 'No'}</b></div><div>Trimmed<b>${b.trimmed ? 'Yes' : 'No'}</b></div><div>Case length<b>${fLen(b.measuredLen)}</b></div><div>Bump<b>${esc(b.bump || '–')}</b></div>
@@ -1436,7 +1586,7 @@ const views = {
       ${it('#/rifles', 'Rifles', S.rifles.length)}${it('#/bullets', 'Bullets', S.bullets.length)}${it('#/powders', 'Powders', S.powders.length)}${it('#/primers', 'Primers', S.primers.length)}${it('#/brass', 'Brass lots', S.brass.length)}
       <h2>App</h2>
       ${sbReady() ? `<div class="btns"><button class="btn pri" data-act="sync">⟳ Sync between devices</button></div>` : ''}
-      <div class="btns"><button class="btn" data-act="settings">Settings, units &amp; brass rules</button><button class="btn" data-act="ai">Photo reading (AI key)</button></div>
+      <div class="btns"><button class="btn" data-act="settings">Settings, units &amp; brass rules</button><button class="btn" data-act="ai">Photo reading (AI key)</button><button class="btn" data-act="notebook">📖 Import notebook pages</button></div>
       <h2>Backup</h2>
       <div class="card sub">${sbReady() ? 'With sync switched on, your data is also kept in the cloud. A backup file is still a good extra copy.' : 'Your data is stored only on this device. Export a backup regularly (save it to OneDrive/Google Drive) — and use it to move data to another phone or PC.'}</div>
       <div class="btns"><button class="btn pri" data-act="export">Export backup</button><button class="btn" data-act="import">Import backup</button><button class="btn" data-act="csv">Export range data (CSV)</button></div>
@@ -1456,7 +1606,7 @@ function stockCard(act, id, title, sub, left, total, unit, badge) {
 }
 function batchCard(b) {
   const left = batchLeft(b);
-  return card('#/batch/' + b.id, `<div class="row"><div class="grow"><div class="ttl">${esc(nLoad(get('loads', b.loadId)))}</div><div class="sub">${b.no ? esc(b.no) + ' · ' : ''}${esc(b.date)} · ${esc(nBrass(get('brass', b.brassId)))}${b.annealed ? ' · annealed' : ''}${(c => c && c.total != null ? ' · ' + money(c.total) + '/rd' : '')(batchCost(b))}</div></div><div style="text-align:right"><div class="ttl">${left}/${b.qty}</div><div class="sub">left</div></div></div>`);
+  return card('#/batch/' + b.id, `<div class="row"><div class="grow"><div class="ttl">${esc(nLoad(get('loads', b.loadId)))}${b.historic ? ' ' + pill('acc', '📖 Notebook') : ''}</div><div class="sub">${b.no ? esc(b.no) + ' · ' : ''}${esc(b.date)} · ${esc(nBrass(get('brass', b.brassId)))}${b.annealed ? ' · annealed' : ''}${(c => c && c.total != null ? ' · ' + money(c.total) + '/rd' : '')(batchCost(b))}</div></div><div style="text-align:right"><div class="ttl">${left}/${b.qty}</div><div class="sub">left</div></div></div>`);
 }
 function sessionCard(s) {
   const shots = s.strings.reduce((a, st) => a + (+st.shots || 0), 0);
@@ -1551,6 +1701,7 @@ const ACTIONS = {
   photo: d => pickPhoto(d.kind),
   lotPhoto: d => lotPhoto(d.k),
   ai: () => aiForm(),
+  notebook: async () => { if (!(await kvGet('apikey'))) { alert('Add your Anthropic API key first (Setup → Photo reading).'); return aiForm(); } pickNotebook(); },
   export: () => download(`reload-log-backup-${today()}.json`, JSON.stringify({ ...S, exported: new Date().toISOString(), app: APP_VERSION }, null, 1), 'application/json'),
   import: () => $('#importfile').click(),
   csv: () => csvExport(),
